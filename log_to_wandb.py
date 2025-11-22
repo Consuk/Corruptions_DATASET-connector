@@ -4,14 +4,14 @@ import wandb
 from PIL import Image
 
 # Configuración
-CORRUPTED_ROOT = "/workspace/endovis_corruptions"
+CORRUPTED_ROOT = "/workspace/datasets/hamlyn/hamlyn_corruptions"
 EXAMPLES_PER_COMBO = 3  # Número de imágenes por corrupción/nivel
 SEED = 42
 
 # Iniciar sesión
 wandb.init(
-    project="endovis-corruption-viewer",
-    name="scared-visual-inspection",
+    project="hamlun-corruption-viewer",
+    name="hamlun-visual-inspection",
     config={"examples_per_combination": EXAMPLES_PER_COMBO}
 )
 

@@ -5,8 +5,8 @@ from endoscopycorruptions import corrupt, get_corruption_names
 from tqdm import tqdm
 
 # Rutas base
-input_root = "/workspace/AF-SfMLearner/endovis_data"
-output_root = "/workspace/endovis_corruptions"
+input_root = "/workspace/datasets/hamlyn"
+output_root = "/workspace/datasets/hamlyn/hamlyn_corruptions"
 
 # Obtener todas las corrupciones disponibles
 corruption_types = get_corruption_names()
