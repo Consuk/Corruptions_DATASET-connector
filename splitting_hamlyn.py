@@ -15,7 +15,8 @@ SPLIT_RATIOS = {
     "test": 551 / TOTAL_SCARED,
 }
 
-OUTPUT_DIR = BASE_PATH.parent  # se guardará al mismo nivel de "Hamlyn/"
+OUTPUT_DIR = BASE_PATH.parent / "splits"  # se guardará al mismo nivel de "Hamlyn/"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 def count_images_per_sequence():
     counts = {}
