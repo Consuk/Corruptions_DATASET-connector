@@ -3,6 +3,7 @@ from pathlib import Path
 from collections import defaultdict
 
 # Ruta al dataset
+print(Path("/workspace/datasets/hamlyn/Hamlyn").exists())
 BASE_PATH = Path("/workspace/datasets/hamlyn/Hamlyn")
 CAMERA_DIR = "image01"
 CAMERA_LABEL = "l"
