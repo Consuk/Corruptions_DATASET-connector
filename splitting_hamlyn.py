@@ -4,6 +4,7 @@ from collections import defaultdict
 
 # Ruta al dataset
 print(Path("/workspace/datasets/hamlyn/Hamlyn").exists())
+print(list((Path("/workspace/datasets/hamlyn/Hamlyn") / "rectified01" / "image01").glob("*.png")))
 BASE_PATH = Path("/workspace/datasets/hamlyn/Hamlyn")
 CAMERA_DIR = "image01"
 CAMERA_LABEL = "l"
