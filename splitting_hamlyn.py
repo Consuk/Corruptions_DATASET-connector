@@ -21,14 +21,15 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 def count_images_per_sequence():
     counts = {}
-    for rectified in sorted(BASE_PATH.glob("rectified*/rectified*")):
-        seq_name = rectified.parent.name
+    for rectified in sorted(BASE_PATH.glob("rectified*")):
+        seq_name = rectified.name
         img_dir = rectified / CAMERA_DIR
         if not img_dir.exists():
             continue
         num_imgs = len(list(img_dir.glob("*.png")))
         counts[seq_name] = num_imgs
     return dict(sorted(counts.items(), key=lambda x: -x[1]))  # mayor a menor
+
 
 def assign_sequences_proportionally(image_counts):
     total_imgs = sum(image_counts.values())
@@ -54,7 +55,7 @@ def generate_txts_from_splits(splits):
     for split, seqs in splits.items():
         lines = []
         for seq in seqs:
-            img_dir = BASE_PATH / seq / seq / CAMERA_DIR
+            img_dir = BASE_PATH / seq / CAMERA_DIR
             if not img_dir.exists():
                 continue
             images = sorted(img_dir.glob("*.png"))
