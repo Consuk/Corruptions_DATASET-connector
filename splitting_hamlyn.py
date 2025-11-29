@@ -3,8 +3,6 @@ from pathlib import Path
 from collections import defaultdict
 
 # Ruta al dataset
-print(Path("/workspace/datasets/hamlyn/Hamlyn").exists())
-print(list((Path("/workspace/datasets/hamlyn/Hamlyn") / "rectified01" / "image01").glob("*.png")))
 BASE_PATH = Path("/workspace/datasets/hamlyn/Hamlyn")
 CAMERA_DIR = "image01"
 CAMERA_LABEL = "l"
@@ -17,20 +15,19 @@ SPLIT_RATIOS = {
     "test": 551 / TOTAL_SCARED,
 }
 
-OUTPUT_DIR = BASE_PATH.parent / "splits"  # se guardará al mismo nivel de "Hamlyn/"
+OUTPUT_DIR = BASE_PATH.parent / "splits"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 def count_images_per_sequence():
     counts = {}
     for rectified in sorted(BASE_PATH.glob("rectified*")):
         seq_name = rectified.name
-        img_dir = rectified / CAMERA_DIR
+        img_dir = rectified / rectified.name / CAMERA_DIR
         if not img_dir.exists():
             continue
-        num_imgs = len(list(img_dir.glob("*.png")))
+        num_imgs = len(list(img_dir.glob("*.jpg")))
         counts[seq_name] = num_imgs
     return dict(sorted(counts.items(), key=lambda x: -x[1]))  # mayor a menor
-
 
 def assign_sequences_proportionally(image_counts):
     total_imgs = sum(image_counts.values())
@@ -56,10 +53,10 @@ def generate_txts_from_splits(splits):
     for split, seqs in splits.items():
         lines = []
         for seq in seqs:
-            img_dir = BASE_PATH / seq / CAMERA_DIR
+            img_dir = BASE_PATH / seq / seq / CAMERA_DIR
             if not img_dir.exists():
                 continue
-            images = sorted(img_dir.glob("*.png"))
+            images = sorted(img_dir.glob("*.jpg"))
             for idx, img in enumerate(images, start=1):
                 rel_path = img.relative_to(BASE_PATH).with_suffix("")
                 lines.append(f"{rel_path} {idx} {CAMERA_LABEL}")
