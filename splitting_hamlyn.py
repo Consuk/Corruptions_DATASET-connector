@@ -53,25 +53,80 @@ def generate_txts_from_splits(splits):
     for split, seqs in splits.items():
         lines = []
         for seq in seqs:
-            img_dir = BASE_PATH / seq / seq / CAMERA_DIR
+            img_dir = BASE_PATH / seq / seq / CAMERA_DIR  # rectifiedXX/rectifiedXX/image01
             if not img_dir.exists():
                 continue
-            images = sorted(img_dir.glob("*.jpg"))
-            for idx, img in enumerate(images, start=1):
-                rel_path = img.relative_to(BASE_PATH).with_suffix("")
-                lines.append(f"{rel_path} {idx} {CAMERA_LABEL}")
+            images = sorted(img_dir.glob("*.jpg"))  # 0000000000.jpg, ...
+
+            for img in images:
+                # Name without extension, e.g. "0000001805"
+                stem = img.stem
+                try:
+                    frame_idx = int(stem)  # 1805
+                except ValueError:
+                    # If some weird file appears, skip it
+                    print(f"[WARN] Skipping non-numeric file: {img}")
+                    continue
+
+                rel_folder = img.parent.relative_to(BASE_PATH)  # rectified08/rectified08/image01
+                lines.append(f"{rel_folder} {frame_idx} {CAMERA_LABEL}")
 
         output_file = OUTPUT_DIR / f"{split}_files_hamlyn.txt"
         with open(output_file, "w") as f:
             f.write("\n".join(lines))
         print(f"[✓] {output_file.name}: {len(lines)} líneas.")
 
+
+def validate_split_file(split_file, img_ext=".jpg"):
+    print(f"\nValidating {split_file} ...")
+    missing = 0
+    total = 0
+
+    with open(split_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            total += 1
+            parts = line.split()
+            if len(parts) != 3:
+                print("[WARN] Malformed line:", line)
+                continue
+
+            folder, idx_str, side = parts
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                print("[WARN] Non-integer index:", line)
+                continue
+
+            # Our new format: folder = rectifiedXX/rectifiedXX/image01
+            # File = <BASE_PATH>/<folder>/<idx formatted as 10 digits>.jpg
+            img_name = f"{idx:010d}{img_ext}"
+            img_path = BASE_PATH / folder / img_name
+
+            if not img_path.exists():
+                missing += 1
+                if missing <= 20:  # don't spam too much
+                    print("  [MISSING]", img_path)
+
+    print(f"Checked {total} lines. Missing files: {missing}")
+    return missing
+
 if __name__ == "__main__":
     print("Contando imágenes por secuencia...")
     image_counts = count_images_per_sequence()
+
     print("Asignando secuencias proporcionalmente...")
     splits = assign_sequences_proportionally(image_counts)
     for s, seqs in splits.items():
         print(f"{s.upper()} ({len(seqs)} sec):", seqs)
+
     print("Generando archivos .txt...")
     generate_txts_from_splits(splits)
+
+    # ---- Validate the generated splits ----
+    for split in ["train", "val", "test"]:
+        split_file = OUTPUT_DIR / f"{split}_files_hamlyn.txt"
+        validate_split_file(split_file, img_ext=".jpg")
+
