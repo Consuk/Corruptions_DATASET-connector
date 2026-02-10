@@ -1,165 +1,249 @@
-
 import os
 import argparse
 from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
 import wandb
+import matplotlib.cm as cm
+
+from utils import readlines
+import datasets
+import networks
+from layers import disp_to_depth
 
 
-def resolve_seq_path(folder: str) -> str:
-    """Given 'rectified05' or 'rectified05/rectified05', return the sequence root path."""
-    norm = folder.strip("/")
-
-    parts = norm.split("/")
-    # If they already pass rectifiedXX/rectifiedXX, keep last 2
-    if len(parts) >= 2 and parts[-1].startswith("rectified") and parts[-2].startswith("rectified"):
-        return os.path.join(parts[-2], parts[-1])
-    # If single token 'rectified05' -> rectified05/rectified05
-    if len(parts) == 1:
-        return os.path.join(parts[0], parts[0])
-    # Otherwise, best effort: last 2 components
-    return os.path.join(parts[-2], parts[-1])
-
-
-def resolve_image_base(folder: str, side: str) -> str:
+def tensor_to_uint8_rgb(t: torch.Tensor) -> np.ndarray:
     """
-    If folder already contains image01/image02 -> keep.
-    Else map side: 'r' -> image02, else -> image01.
+    t: (1,3,H,W) or (3,H,W), assumed in [0,1] after dataset preprocessing.
+    Returns uint8 RGB HxWx3
     """
-    norm = folder.strip("/")
-    parts = norm.split("/")
-
-    if any(p == "image01" or p == "image02" for p in parts):
-        return norm  # already points to the image folder
-
-    seq_path = resolve_seq_path(norm)
-    cam = "image02" if (side and side.lower().startswith("r")) else "image01"
-    return os.path.join(seq_path, cam)
-
-
-def find_frame_file(root: str, base: str, frame_id: int, exts) -> str:
-    fname = f"{frame_id:010d}"
-    for ext in exts:
-        p = os.path.join(root, base, fname + ext)
-        if os.path.isfile(p):
-            return p
-    return None
-
-
-def load_rgb(path: str) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    if img is None:
-        raise RuntimeError(f"cv2.imread failed: {path}")
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if t.ndim == 4:
+        t = t[0]
+    t = t.detach().cpu().clamp(0, 1)
+    img = (t.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
     return img
 
 
-def depth_to_vis(depth: np.ndarray) -> np.ndarray:
-    """Make a nice visualization for depth: clip to p1-p99 on nonzero values."""
-    d = depth.astype(np.float32)
-    v = d[d > 0]
+def sanitize_gt_depth(d: np.ndarray) -> np.ndarray:
+    """Remove typical invalid sentinels."""
+    d = d.astype(np.float32)
+    d[(d == 65535.0) | (d < 0)] = 0.0
+    return d
+
+
+def percentile_normalize(x: np.ndarray, valid_mask: np.ndarray, p_lo=1, p_hi=99) -> np.ndarray:
+    """
+    Normalize x to [0,1] using percentiles computed on valid_mask pixels.
+    Returns float32 HxW in [0,1]
+    """
+    if valid_mask is None:
+        valid_mask = np.isfinite(x)
+
+    v = x[valid_mask]
     if v.size == 0:
-        vis = np.zeros_like(d, dtype=np.float32)
-        return vis
-    p1, p99 = np.percentile(v, [1, 99]).astype(np.float32)
-    if p99 <= p1:
-        p1, p99 = float(v.min()), float(v.max())
-        if p99 <= p1:
-            return np.zeros_like(d, dtype=np.float32)
-    vis = np.clip(d, p1, p99)
-    # normalize to 0..1 for wandb
-    vis = (vis - p1) / (p99 - p1 + 1e-6)
-    return vis
+        return np.zeros_like(x, dtype=np.float32)
+
+    lo, hi = np.percentile(v, [p_lo, p_hi]).astype(np.float32)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = float(v.min()), float(v.max())
+        if hi <= lo:
+            return np.zeros_like(x, dtype=np.float32)
+
+    y = np.clip(x, lo, hi)
+    y = (y - lo) / (hi - lo + 1e-6)
+    return y.astype(np.float32)
+
+
+def colorize01(x01: np.ndarray, cmap_name="magma") -> np.ndarray:
+    """
+    x01: float32 HxW in [0,1]
+    Returns uint8 RGB HxWx3
+    """
+    cmap = cm.get_cmap(cmap_name)
+    rgba = cmap(np.clip(x01, 0, 1))
+    rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
+    return rgb
+
+
+def make_valid_mask(gt: np.ndarray, min_depth: float, max_depth: float) -> np.ndarray:
+    return (gt > min_depth) & (gt < max_depth)
+
+
+def load_model(weights_folder: str, device: torch.device):
+    # ResNet18 encoder + standard DepthDecoder (como evaluate_depth.py)
+    encoder = networks.ResnetEncoder(18, False)
+    depth_decoder = networks.DepthDecoder(num_ch_enc=encoder.num_ch_enc, scales=range(4))
+
+    encoder_path = os.path.join(weights_folder, "encoder.pth")
+    depth_path = os.path.join(weights_folder, "depth.pth")
+
+    if not os.path.isfile(encoder_path) or not os.path.isfile(depth_path):
+        raise FileNotFoundError(
+            f"Expected encoder.pth and depth.pth in {weights_folder}. "
+            f"Found encoder={os.path.isfile(encoder_path)} depth={os.path.isfile(depth_path)}"
+        )
+
+    loaded = torch.load(encoder_path, map_location=device)
+    filtered = {k: v for k, v in loaded.items() if k in encoder.state_dict()}
+    encoder.load_state_dict(filtered)
+
+    depth_decoder.load_state_dict(torch.load(depth_path, map_location=device))
+
+    encoder.to(device).eval()
+    depth_decoder.to(device).eval()
+    return encoder, depth_decoder
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_path", required=True, help="Hamlyn root, e.g. /workspace/datasets/hamlyn/Hamlyn")
-    ap.add_argument("--split_file", required=True, help="Path to test_files2.txt")
-    ap.add_argument("--project", default="hamlyn-test-images")
-    ap.add_argument("--run_name", default="test_files2_rgb_log")
-    ap.add_argument("--max_images", type=int, default=200, help="How many images to log (avoid huge runs). Use 0 for ALL.")
-    ap.add_argument("--stride", type=int, default=1, help="Log every Nth sample")
-    ap.add_argument("--start", type=int, default=0, help="Start index in split file")
-    ap.add_argument("--gt_npz", default=None, help="Optional: path to test_files2_gt_depths.npz to log depth too")
-    ap.add_argument("--log_depth", action="store_true", help="If set, logs gt depth (requires --gt_npz)")
+    ap.add_argument("--data_path", required=True)
+    ap.add_argument("--split_file", required=True, help="test_files2.txt")
+    ap.add_argument("--gt_npz", required=True, help="test_files2_gt_depths.npz (data=object array)")
+    ap.add_argument("--weights_folder", required=True, help="folder with encoder.pth & depth.pth")
+    ap.add_argument("--dataset", default="hamlyn")
+    ap.add_argument("--height", type=int, default=256)
+    ap.add_argument("--width", type=int, default=320)
+    ap.add_argument("--batch_size", type=int, default=1)
+
+    ap.add_argument("--min_depth", type=float, default=1.0)
+    ap.add_argument("--max_depth", type=float, default=300.0)
+
+    ap.add_argument("--max_images", type=int, default=200, help="0 = all")
+    ap.add_argument("--stride", type=int, default=5)
+    ap.add_argument("--start", type=int, default=0)
+
+    ap.add_argument("--project", default="hamlyn-eval-visuals")
+    ap.add_argument("--run_name", default="test_files2_rgb_gt_pred_error")
+    ap.add_argument("--cmap", default="magma")
+
     args = ap.parse_args()
 
-    lines = [l.strip() for l in Path(args.split_file).read_text().splitlines() if l.strip()]
-    print(f"Loaded split lines: {len(lines)} from {args.split_file}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    gt = None
-    if args.log_depth:
-        if not args.gt_npz:
-            raise ValueError("--log_depth requires --gt_npz")
-        gt = np.load(args.gt_npz, allow_pickle=True)["data"]
-        gt = list(gt) if isinstance(gt, np.ndarray) and gt.dtype == object else gt
-        if len(gt) != len(lines):
-            print(f"[WARN] gt maps ({len(gt)}) != split lines ({len(lines)}). Depth logging may misalign.")
+    filenames = [l.strip() for l in Path(args.split_file).read_text().splitlines() if l.strip()]
+    gt = np.load(args.gt_npz, allow_pickle=True)["data"]
+    gt = list(gt) if isinstance(gt, np.ndarray) and gt.dtype == object else gt
+
+    if len(gt) != len(filenames):
+        print(f"[WARN] gt maps ({len(gt)}) != split lines ({len(filenames)}). (Ideal: same)")
+
+    # dataset loader (Monodepth2-style)
+    if args.dataset.lower() == "hamlyn":
+        DatasetClass = datasets.HamlynDataset
+    else:
+        raise ValueError(f"Only hamlyn implemented in this logger. Got: {args.dataset}")
+
+    dataset = DatasetClass(
+        args.data_path,
+        filenames,
+        args.height,
+        args.width,
+        frame_idxs=[0],
+        num_scales=4,
+        is_train=False
+    )
+
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True, drop_last=False)
+
+    encoder, depth_decoder = load_model(args.weights_folder, device)
 
     wandb.init(project=args.project, name=args.run_name, config=vars(args))
 
-    table_cols = ["idx", "line", "image_path", "rgb"]
-    if args.log_depth:
-        table_cols += ["gt_depth_vis"]
+    cols = [
+        "idx",
+        "line",
+        "rgb",
+        "gt_depth",
+        "pred_depth",
+        "absrel_error",
+        "valid_frac",
+        "gt_med",
+        "pred_med",
+    ]
+    table = wandb.Table(columns=cols)
 
-    table = wandb.Table(columns=table_cols)
+    logged = 0
+    with torch.no_grad():
+        for i, inputs in enumerate(loader):
+            if i < args.start:
+                continue
+            if (i - args.start) % max(1, args.stride) != 0:
+                continue
+            if args.max_images and logged >= args.max_images:
+                break
 
-    exts = [".jpg", ".jpeg", ".png", ".tiff", ".tif"]
+            # RGB input tensor key (Monodepth2)
+            color = inputs[("color", 0, 0)].to(device)  # (B,3,H,W)
 
-    count = 0
-    for idx in range(args.start, len(lines), max(1, args.stride)):
-        if args.max_images and count >= args.max_images:
-            break
+            # Forward
+            feats = encoder(color)
+            outputs = depth_decoder(feats)
+            disp = outputs[("disp", 0)]
+            _, pred_depth_t = disp_to_depth(disp, args.min_depth, args.max_depth)  # (B,1,H,W)
 
-        parts = lines[idx].split()
-        if len(parts) < 2:
-            print(f"[SKIP] bad line idx={idx}: {lines[idx]}")
-            continue
+            # Convert RGB
+            rgb_u8 = tensor_to_uint8_rgb(color)
 
-        folder = parts[0]
-        frame_id = int(parts[1])
-        side = parts[2] if len(parts) > 2 else "l"
+            # GT depth for this index
+            if i >= len(gt):
+                print(f"[WARN] No GT for idx={i}; skipping")
+                continue
+            gt_d = sanitize_gt_depth(gt[i])
 
-        img_base = resolve_image_base(folder, side)
-        img_path = find_frame_file(args.data_path, img_base, frame_id, exts)
+            # Resize pred depth to GT shape (como evaluate_depth.py hace internamente)
+            pred_depth = pred_depth_t[0, 0].detach().cpu().numpy().astype(np.float32)
+            pred_depth = cv2.resize(pred_depth, (gt_d.shape[1], gt_d.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-        if img_path is None:
-            print(f"[MISS] idx={idx} | {lines[idx]} | tried base={os.path.join(args.data_path, img_base)}")
-            continue
+            # Build mask
+            m = make_valid_mask(gt_d, args.min_depth, args.max_depth)
+            valid_frac = float(m.mean())
 
-        try:
-            rgb = load_rgb(img_path)
-        except Exception as e:
-            print(f"[ERR] idx={idx} reading {img_path}: {e}")
-            continue
+            # Stats
+            gt_med = float(np.median(gt_d[m])) if m.any() else float("nan")
+            pred_med = float(np.median(pred_depth[m])) if m.any() else float("nan")
 
-        caption = f"idx={idx} | {lines[idx]} | {img_base} | {os.path.basename(img_path)}"
-        rgb_w = wandb.Image(rgb, caption=caption)
+            # Visualizations (clear)
+            gt01 = percentile_normalize(gt_d, m, 1, 99)
+            pred01 = percentile_normalize(pred_depth, m, 1, 99)
 
-        row = [idx, lines[idx], img_path, rgb_w]
+            gt_rgb = colorize01(gt01, args.cmap)
+            pred_rgb = colorize01(pred01, args.cmap)
 
-        if args.log_depth and gt is not None and idx < len(gt):
-            d = gt[idx]
-            dvis = depth_to_vis(d)
-            # wandb.Image soporta floats 0..1
-            row.append(wandb.Image(dvis, caption=f"GT depth (vis) | {caption}"))
+            # AbsRel error map: |pred-gt|/gt on valid mask
+            err = np.zeros_like(gt_d, dtype=np.float32)
+            if m.any():
+                err[m] = np.abs(pred_depth[m] - gt_d[m]) / (gt_d[m] + 1e-6)
+            # normalize error for display (clip to p99)
+            err01 = percentile_normalize(err, m, 1, 99)
+            err_rgb = colorize01(err01, "inferno")  # error se ve mejor con inferno
 
-        table.add_data(*row)
-        count += 1
+            caption = f"idx={i} | valid={valid_frac:.3f} | gt_med={gt_med:.2f} pred_med={pred_med:.2f} | {filenames[i]}"
 
-        if count % 25 == 0:
-            wandb.log({"test_files2_samples": table})
-            print(f"Logged {count} samples...")
+            table.add_data(
+                i,
+                filenames[i],
+                wandb.Image(rgb_u8, caption="RGB | " + caption),
+                wandb.Image(gt_rgb, caption="GT depth (p1–p99) | " + caption),
+                wandb.Image(pred_rgb, caption="Pred depth (p1–p99) | " + caption),
+                wandb.Image(err_rgb, caption="AbsRel error (p1–p99) | " + caption),
+                valid_frac,
+                gt_med,
+                pred_med
+            )
 
-    wandb.log({"test_files2_samples": table})
+            logged += 1
+            if logged % 25 == 0:
+                wandb.log({"test_files2_visuals": table})
+                print(f"Logged {logged} samples...")
+
+    wandb.log({"test_files2_visuals": table})
     wandb.finish()
-    print(f"Done. Logged samples: {count}")
+    print("Done. Logged:", logged)
 
 
 if __name__ == "__main__":
     main()
-
-  
