@@ -7,9 +7,9 @@ from tqdm import tqdm
 # =========================
 # Configuración de rutas
 # =========================
-TEST_LIST   = "/workspace/datasets/hamlyn/splits/test_files2.txt"
+TEST_LIST   = "/workspace/datasets/hamlyn/splits24/test_files24.txt"
 INPUT_ROOT  = "/workspace/datasets/hamlyn/Hamlyn"
-OUTPUT_ROOT = "/workspace/datasets/hamlyn/hamlyn_corruptions_test"
+OUTPUT_ROOT = "/workspace/datasets/hamlyn/hamlyn_corruptions_test24"
 
 corruption_types = get_corruption_names()
 severities = [1, 2, 3, 4, 5]
