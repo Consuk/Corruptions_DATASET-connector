@@ -92,6 +92,7 @@ class ModelSpec:
     code_root: Optional[Path] = None
     checkpoint_files: Optional[list[str]] = None
     pretrained_path: Optional[Path] = None
+    load_audit: Optional[list[dict]] = None
 
 
 def prepare_import_path(code_root: Optional[Path], purge_prefixes: Iterable[str]) -> None:
@@ -129,6 +130,7 @@ class Monodepth2Predictor:
         self.max_depth = max_depth
         self.device_name = device
         self.output_mode = output_mode
+        self.load_audit = []
 
         prepare_import_path(code_root, purge_prefixes=["networks", "layers"])
 
@@ -233,18 +235,51 @@ class Monodepth2Predictor:
             raise RuntimeError(f"{model_name}: checkpoint is not a state dict")
         model_dict = model.state_dict()
         filtered = {}
+        source_matched = set()
+        shape_mismatches = []
         for key, value in state_dict.items():
+            key_had_shape_mismatch = False
             for candidate in self._candidate_keys(key):
                 if candidate not in model_dict:
                     continue
                 if hasattr(value, "shape") and hasattr(model_dict[candidate], "shape"):
                     if tuple(value.shape) != tuple(model_dict[candidate].shape):
+                        key_had_shape_mismatch = True
+                        if len(shape_mismatches) < 12:
+                            shape_mismatches.append(
+                                {
+                                    "checkpoint_key": key,
+                                    "model_key": candidate,
+                                    "checkpoint_shape": list(value.shape),
+                                    "model_shape": list(model_dict[candidate].shape),
+                                }
+                            )
                         continue
                 filtered[candidate] = value
+                source_matched.add(key)
                 break
+            if key_had_shape_mismatch:
+                continue
         if not filtered:
             raise RuntimeError(f"{model_name}: no checkpoint keys matched the model")
-        model.load_state_dict(filtered, strict=False)
+        result = model.load_state_dict(filtered, strict=False)
+        missing_keys = list(getattr(result, "missing_keys", []))
+        unexpected_keys = [k for k in state_dict.keys() if k not in source_matched]
+        audit = {
+            "module": model_name,
+            "checkpoint_keys": len(state_dict),
+            "model_keys": len(model_dict),
+            "loaded_keys": len(filtered),
+            "missing_model_keys": len(missing_keys),
+            "unexpected_checkpoint_keys": len(unexpected_keys),
+            "shape_mismatch_count": len(shape_mismatches),
+            "missing_model_keys_sample": missing_keys[:12],
+            "unexpected_checkpoint_keys_sample": unexpected_keys[:12],
+            "shape_mismatches_sample": shape_mismatches,
+        }
+        if not hasattr(self, "load_audit"):
+            self.load_audit = []
+        self.load_audit.append(audit)
 
     def predict(self, rgb: Image.Image) -> np.ndarray:
         image = rgb.convert("RGB").resize((self.width, self.height), Image.LANCZOS)
@@ -288,6 +323,7 @@ class MonoViTPredictor(Monodepth2Predictor):
         self.max_depth = max_depth
         self.device_name = device
         self.output_mode = output_mode
+        self.load_audit = []
 
         prepare_import_path(code_root, purge_prefixes=["networks", "layers"])
 
@@ -356,6 +392,7 @@ class EndoDacPredictor(Monodepth2Predictor):
         self.max_depth = max_depth
         self.device_name = device
         self.output_mode = output_mode
+        self.load_audit = []
 
         prepare_import_path(code_root, purge_prefixes=["models", "utils"])
 
@@ -437,6 +474,7 @@ class ManyDepthPredictor(Monodepth2Predictor):
         self.device_name = device
         self.output_mode = output_mode
         self.mode = mode
+        self.load_audit = []
 
         if code_root is not None and code_root.name.lower() == "manydepth":
             code_root = code_root.parent
@@ -545,6 +583,7 @@ class EndoSfmLearnerPredictor(Monodepth2Predictor):
         self.weights_folder = weights_folder
         self.height = height
         self.width = width
+        self.load_audit = []
 
         prepare_import_path(code_root, purge_prefixes=["models"])
 
@@ -566,7 +605,21 @@ class EndoSfmLearnerPredictor(Monodepth2Predictor):
             raise RuntimeError(f"{name}: {checkpoint_path} does not contain a state_dict")
 
         self.disp_net = models.DispResNet(18, False).to(self.device)
-        self.disp_net.load_state_dict(checkpoint["state_dict"])
+        result = self.disp_net.load_state_dict(checkpoint["state_dict"])
+        self.load_audit.append(
+            {
+                "module": f"{name}/dispnet",
+                "checkpoint_keys": len(checkpoint["state_dict"]),
+                "model_keys": len(self.disp_net.state_dict()),
+                "loaded_keys": len(checkpoint["state_dict"]),
+                "missing_model_keys": len(list(getattr(result, "missing_keys", []))),
+                "unexpected_checkpoint_keys": len(list(getattr(result, "unexpected_keys", []))),
+                "shape_mismatch_count": 0,
+                "missing_model_keys_sample": list(getattr(result, "missing_keys", []))[:12],
+                "unexpected_checkpoint_keys_sample": list(getattr(result, "unexpected_keys", []))[:12],
+                "shape_mismatches_sample": [],
+            }
+        )
         self.disp_net.eval()
 
     @staticmethod
@@ -692,6 +745,22 @@ def parse_args() -> argparse.Namespace:
         choices=["mono"],
         default="mono",
         help="ManyDepth qualitative mode. Mono uses a zero cost volume for single-frame figures.",
+    )
+    parser.add_argument(
+        "--print_load_audit",
+        action="store_true",
+        help="Print loaded/missing/mismatched key counts for every model component.",
+    )
+    parser.add_argument(
+        "--print_prediction_stats",
+        action="store_true",
+        help="Print numeric prediction stats for the first rows.",
+    )
+    parser.add_argument(
+        "--prediction_stats_rows",
+        type=int,
+        default=1,
+        help="How many corruption rows to print when --print_prediction_stats is set.",
     )
 
     parser.add_argument("--split_file", default=None)
@@ -1473,11 +1542,14 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                         device=args.device,
                         output_mode=args.model_output,
                     )
+                predictor = predictors[spec.name]
+                spec.load_audit = list(getattr(predictor, "load_audit", []))
             except Exception as exc:
                 if args.missing_policy == "error":
                     raise
                 predictors[spec.name] = exc
                 print(f"[WARN] {spec.name}: could not initialize model, cells will be placeholders: {exc}")
+                spec.load_audit = [{"error": str(exc)}]
         elif spec.kind == "predictions":
             predictors[spec.name] = None
         else:
@@ -1521,6 +1593,53 @@ def print_model_summary(specs: list[ModelSpec]) -> None:
             print("  checkpoint_files:")
             for path in spec.checkpoint_files:
                 print(f"    - {path}")
+
+
+def print_load_audit(specs: list[ModelSpec]) -> None:
+    print("\n======= LOAD AUDIT =======")
+    for spec in specs:
+        print(f"- {spec.name}")
+        if not spec.load_audit:
+            print("  no load audit recorded")
+            continue
+        for audit in spec.load_audit:
+            if "error" in audit:
+                print(f"  ERROR: {audit['error']}")
+                continue
+            print(
+                "  {module}: loaded {loaded_keys}/{model_keys} model keys "
+                "from {checkpoint_keys} checkpoint keys | missing={missing_model_keys} "
+                "| unexpected={unexpected_checkpoint_keys} | shape_mismatch={shape_mismatch_count}".format(
+                    **audit
+                )
+            )
+            if audit["missing_model_keys_sample"]:
+                print(f"    missing sample: {audit['missing_model_keys_sample']}")
+            if audit["unexpected_checkpoint_keys_sample"]:
+                print(f"    unexpected sample: {audit['unexpected_checkpoint_keys_sample']}")
+            if audit["shape_mismatches_sample"]:
+                print(f"    shape mismatch sample: {audit['shape_mismatches_sample']}")
+
+
+def prediction_stats(values: np.ndarray) -> dict:
+    arr = values.astype(np.float32)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return {"shape": list(arr.shape), "finite_frac": 0.0}
+    dy = np.abs(np.diff(arr, axis=0)).mean() if arr.shape[0] > 1 else 0.0
+    dx = np.abs(np.diff(arr, axis=1)).mean() if arr.ndim >= 2 and arr.shape[1] > 1 else 0.0
+    return {
+        "shape": list(arr.shape),
+        "finite_frac": float(np.isfinite(arr).mean()),
+        "min": float(np.min(finite)),
+        "p1": float(np.percentile(finite, 1)),
+        "p50": float(np.percentile(finite, 50)),
+        "p99": float(np.percentile(finite, 99)),
+        "max": float(np.max(finite)),
+        "mean": float(np.mean(finite)),
+        "std": float(np.std(finite)),
+        "roughness_absdiff_mean": float((dx + dy) * 0.5),
+    }
 
 
 def log_grid_to_wandb(
@@ -1590,6 +1709,8 @@ def main() -> None:
 
     predictors = build_predictors(args, specs)
     print_model_summary(specs)
+    if args.print_load_audit:
+        print_load_audit(specs)
 
     cell_size = (args.cell_width, args.cell_height)
     header_font = load_font(args.font_size, bold=True)
@@ -1631,6 +1752,7 @@ def main() -> None:
                 "code_root": str(spec.code_root) if spec.code_root is not None else None,
                 "pretrained_path": str(spec.pretrained_path) if spec.pretrained_path is not None else None,
                 "checkpoint_files": spec.checkpoint_files or [],
+                "load_audit": spec.load_audit or [],
             }
             for spec in specs
         ],
@@ -1668,6 +1790,20 @@ def main() -> None:
                     if isinstance(predictors[spec.name], Exception):
                         raise RuntimeError(str(predictors[spec.name]))
                     pred = predictors[spec.name].predict(rgb)
+                    stats = prediction_stats(pred)
+                    if args.print_prediction_stats and row_idx < args.prediction_stats_rows:
+                        print(
+                            "[PRED] {corr} | {model}: p1={p1:.4g} p50={p50:.4g} "
+                            "p99={p99:.4g} std={std:.4g} rough={rough:.4g}".format(
+                                corr=corruption,
+                                model=spec.name,
+                                p1=stats.get("p1", float("nan")),
+                                p50=stats.get("p50", float("nan")),
+                                p99=stats.get("p99", float("nan")),
+                                std=stats.get("std", float("nan")),
+                                rough=stats.get("roughness_absdiff_mean", float("nan")),
+                            )
+                        )
                     cell = prediction_to_image(
                         pred,
                         cell_size=cell_size,
@@ -1676,7 +1812,9 @@ def main() -> None:
                         high=args.normalize_high,
                         invert=False,
                     )
-                    row_meta["cells"].append({"model": spec.name, "source": "inference"})
+                    row_meta["cells"].append(
+                        {"model": spec.name, "source": "inference", "prediction_stats": stats}
+                    )
                 else:
                     pred_path = find_prediction(spec.path, corruption, args.severity, row_rel)
                     if pred_path is None:
@@ -1686,7 +1824,9 @@ def main() -> None:
                     loaded = load_prediction_file(pred_path)
                     if isinstance(loaded, Image.Image):
                         cell = resize_to_cell(loaded, cell_size)
+                        stats = None
                     else:
+                        stats = prediction_stats(loaded)
                         cell = prediction_to_image(
                             loaded,
                             cell_size=cell_size,
@@ -1695,7 +1835,9 @@ def main() -> None:
                             high=args.normalize_high,
                             invert=args.invert_prediction_files,
                         )
-                    row_meta["cells"].append({"model": spec.name, "source": str(pred_path)})
+                    row_meta["cells"].append(
+                        {"model": spec.name, "source": str(pred_path), "prediction_stats": stats}
+                    )
             except Exception as exc:
                 if args.missing_policy == "error":
                     raise
