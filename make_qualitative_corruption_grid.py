@@ -525,6 +525,75 @@ class ManyDepthPredictor(Monodepth2Predictor):
         return np.asarray(pred_img).astype(np.float32)
 
 
+class EndoSfmLearnerPredictor(Monodepth2Predictor):
+    def __init__(
+        self,
+        name: str,
+        weights_folder: Path,
+        code_root: Optional[Path],
+        height: int,
+        width: int,
+        device: str,
+    ) -> None:
+        self.name = name
+        self.weights_folder = weights_folder
+        self.height = height
+        self.width = width
+
+        prepare_import_path(code_root, purge_prefixes=["models"])
+
+        try:
+            import torch
+            import models
+        except Exception as exc:  # pragma: no cover - depends on the VM repo.
+            raise RuntimeError(
+                "Could not import EndoSfMLearner models. Pass "
+                "--model_code_roots EndoSfMLearner=/path/to/EndoSfMLearner."
+            ) from exc
+
+        self.torch = torch
+        self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+
+        checkpoint_path = self._find_dispnet_checkpoint(weights_folder)
+        checkpoint = self._load_torch_file(checkpoint_path)
+        if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+            raise RuntimeError(f"{name}: {checkpoint_path} does not contain a state_dict")
+
+        self.disp_net = models.DispResNet(18, False).to(self.device)
+        self.disp_net.load_state_dict(checkpoint["state_dict"])
+        self.disp_net.eval()
+
+    @staticmethod
+    def _find_dispnet_checkpoint(weights_folder: Path) -> Path:
+        candidates = [
+            weights_folder / "dispnet_model_best.pth.tar",
+            weights_folder / "dispnet_checkpoint.pth.tar",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        for current_root, _, files in os.walk(weights_folder):
+            for name in ("dispnet_model_best.pth.tar", "dispnet_checkpoint.pth.tar"):
+                if name in files:
+                    return Path(current_root) / name
+        raise FileNotFoundError(
+            f"expected dispnet_model_best.pth.tar or dispnet_checkpoint.pth.tar inside {weights_folder}"
+        )
+
+    def predict(self, rgb: Image.Image) -> np.ndarray:
+        image = rgb.convert("RGB").resize((self.width, self.height), Image.LANCZOS)
+        arr = np.asarray(image).astype(np.float32)
+        arr = np.transpose(arr, (2, 0, 1))
+        tensor = ((self.torch.from_numpy(arr).unsqueeze(0) / 255.0 - 0.45) / 0.225).to(self.device)
+
+        with self.torch.no_grad():
+            pred = self.disp_net(tensor).detach().cpu().numpy()[0, 0].astype(np.float32)
+
+        pred_img = Image.fromarray(pred, mode="F")
+        pred_img = pred_img.resize(rgb.size, Image.BILINEAR)
+        return np.asarray(pred_img).astype(np.float32)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -578,7 +647,7 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=[],
         metavar="NAME=TYPE",
-        help="Optional per-model type: monodepth2, monovit, endodac, manydepth.",
+        help="Optional per-model type: monodepth2, monovit, endodac, manydepth, endosfm.",
     )
     parser.add_argument(
         "--model_code_roots",
@@ -708,6 +777,8 @@ def infer_model_kind(spec: ModelSpec, explicit_types: dict[str, str]) -> str:
     joined = normalize_match_text(f"{spec.name} {spec.path}")
     if "endodac" in joined:
         return "endodac"
+    if "endosfm" in joined or "endosfmlearner" in joined:
+        return "endosfm"
     if "monovit" in joined:
         return "monovit"
     if "manydepth" in joined:
@@ -1157,6 +1228,11 @@ def valid_weights_folder(path: Path, kind: str = "monodepth2") -> bool:
         return False
     if kind == "endodac":
         return (path / "depth_model.pth").is_file()
+    if kind == "endosfm":
+        return (
+            (path / "dispnet_model_best.pth.tar").is_file()
+            or (path / "dispnet_checkpoint.pth.tar").is_file()
+        )
     return (path / "encoder.pth").is_file() and (path / "depth.pth").is_file()
 
 
@@ -1319,7 +1395,13 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                     code_root = parent.parent
                     break
 
-        if spec.kind in {"monodepth2", "monovit", "endodac", "manydepth"}:
+        if code_root is None and spec.kind == "endosfm":
+            for parent in [spec.path, *spec.path.parents]:
+                if parent.name == "EndoSfMLearner":
+                    code_root = parent
+                    break
+
+        if spec.kind in {"monodepth2", "monovit", "endodac", "manydepth", "endosfm"}:
             spec.path = resolve_backup_weights_folder(spec, args)
             try:
                 if spec.kind == "monovit":
@@ -1359,6 +1441,15 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                         device=args.device,
                         output_mode=args.model_output,
                         mode=args.manydepth_mode,
+                    )
+                elif spec.kind == "endosfm":
+                    predictors[spec.name] = EndoSfmLearnerPredictor(
+                        name=spec.name,
+                        weights_folder=spec.path,
+                        code_root=code_root,
+                        height=args.height,
+                        width=args.width,
+                        device=args.device,
                     )
                 else:
                     predictors[spec.name] = Monodepth2Predictor(
