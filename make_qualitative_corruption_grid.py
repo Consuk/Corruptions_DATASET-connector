@@ -1017,6 +1017,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="How many corruption rows to print when --print_prediction_stats is set.",
     )
+    parser.add_argument(
+        "--min_loaded_ratio",
+        type=float,
+        default=0.95,
+        help="Minimum loaded/model key ratio required for model components when --missing_policy error.",
+    )
 
     parser.add_argument("--split_file", default=None)
     parser.add_argument("--split_index", type=int, default=0)
@@ -1876,6 +1882,29 @@ def print_load_audit(specs: list[ModelSpec]) -> None:
                 print(f"    shape mismatch sample: {audit['shape_mismatches_sample']}")
 
 
+def validate_load_audit(specs: list[ModelSpec], min_loaded_ratio: float) -> None:
+    failures = []
+    for spec in specs:
+        for audit in spec.load_audit or []:
+            if "error" in audit:
+                failures.append(f"{spec.name}: {audit['error']}")
+                continue
+            model_keys = max(1, int(audit.get("model_keys", 0)))
+            loaded_keys = int(audit.get("loaded_keys", 0))
+            ratio = loaded_keys / float(model_keys)
+            if ratio < min_loaded_ratio:
+                failures.append(
+                    f"{audit.get('module', spec.name)} loaded {loaded_keys}/{model_keys} "
+                    f"keys ({ratio:.1%}), below required {min_loaded_ratio:.0%}"
+                )
+    if failures:
+        details = "\n  - ".join(failures)
+        raise RuntimeError(
+            "Model loading audit failed. Do not trust the qualitative grid yet:\n"
+            f"  - {details}"
+        )
+
+
 def prediction_stats(values: np.ndarray) -> dict:
     arr = values.astype(np.float32)
     finite = arr[np.isfinite(arr)]
@@ -1966,6 +1995,8 @@ def main() -> None:
     print_model_summary(specs)
     if args.print_load_audit:
         print_load_audit(specs)
+    if args.missing_policy == "error":
+        validate_load_audit(specs, args.min_loaded_ratio)
 
     cell_size = (args.cell_width, args.cell_height)
     header_font = load_font(args.font_size, bold=True)
