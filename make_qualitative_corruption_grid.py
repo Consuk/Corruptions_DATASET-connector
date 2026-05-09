@@ -91,6 +91,19 @@ class ModelSpec:
     path: Path
 
 
+def prepare_import_path(code_root: Optional[Path], purge_prefixes: Iterable[str]) -> None:
+    if code_root is not None:
+        code_root = code_root.expanduser().resolve()
+        root_str = str(code_root)
+        sys.path[:] = [p for p in sys.path if p != root_str]
+        sys.path.insert(0, root_str)
+
+    for prefix in purge_prefixes:
+        for module_name in list(sys.modules):
+            if module_name == prefix or module_name.startswith(prefix + "."):
+                del sys.modules[module_name]
+
+
 class Monodepth2Predictor:
     def __init__(
         self,
@@ -114,9 +127,7 @@ class Monodepth2Predictor:
         self.device_name = device
         self.output_mode = output_mode
 
-        if code_root is not None:
-            code_root = code_root.expanduser().resolve()
-            sys.path.insert(0, str(code_root))
+        prepare_import_path(code_root, purge_prefixes=["networks", "layers"])
 
         try:
             import torch
@@ -150,9 +161,12 @@ class Monodepth2Predictor:
 
         encoder_dict = self._unwrap_state_dict(encoder_dict)
         decoder_dict = self._unwrap_state_dict(decoder_dict)
+        if isinstance(encoder_dict, dict):
+            self.height = int(encoder_dict.get("height", self.height))
+            self.width = int(encoder_dict.get("width", self.width))
 
         self._load_partial(self.encoder, encoder_dict, model_name=f"{name}/encoder")
-        self.depth_decoder.load_state_dict(self._strip_module_prefix(decoder_dict), strict=False)
+        self._load_partial(self.depth_decoder, decoder_dict, model_name=f"{name}/depth")
 
         self.encoder.to(self.device).eval()
         self.depth_decoder.to(self.device).eval()
@@ -180,12 +194,51 @@ class Monodepth2Predictor:
             out[key[7:] if key.startswith("module.") else key] = value
         return out
 
+    @staticmethod
+    def _candidate_keys(key: str) -> list[str]:
+        keys = [key]
+        prefixes = [
+            "module.",
+            "model.",
+            "net.",
+            "encoder.",
+            "depth.",
+            "depth_decoder.",
+            "module.model.",
+            "module.net.",
+            "module.encoder.",
+            "module.depth.",
+            "module.depth_decoder.",
+        ]
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                keys.append(key[len(prefix) :])
+
+        parts = key.split(".")
+        for drop in range(1, min(4, len(parts))):
+            keys.append(".".join(parts[drop:]))
+
+        out = []
+        for candidate in keys:
+            if candidate and candidate not in out:
+                out.append(candidate)
+        return out
+
     def _load_partial(self, model, state_dict, model_name: str) -> None:
         state_dict = self._strip_module_prefix(state_dict)
         if not isinstance(state_dict, dict):
             raise RuntimeError(f"{model_name}: checkpoint is not a state dict")
         model_dict = model.state_dict()
-        filtered = {k: v for k, v in state_dict.items() if k in model_dict}
+        filtered = {}
+        for key, value in state_dict.items():
+            for candidate in self._candidate_keys(key):
+                if candidate not in model_dict:
+                    continue
+                if hasattr(value, "shape") and hasattr(model_dict[candidate], "shape"):
+                    if tuple(value.shape) != tuple(model_dict[candidate].shape):
+                        continue
+                filtered[candidate] = value
+                break
         if not filtered:
             raise RuntimeError(f"{model_name}: no checkpoint keys matched the model")
         model.load_state_dict(filtered, strict=False)
@@ -205,6 +258,267 @@ class Monodepth2Predictor:
                 pred = depth[0, 0].detach().cpu().numpy()
             else:
                 pred = scaled_disp[0, 0].detach().cpu().numpy()
+
+        pred_img = Image.fromarray(pred.astype(np.float32), mode="F")
+        pred_img = pred_img.resize(rgb.size, Image.BILINEAR)
+        return np.asarray(pred_img).astype(np.float32)
+
+
+class MonoViTPredictor(Monodepth2Predictor):
+    def __init__(
+        self,
+        name: str,
+        weights_folder: Path,
+        code_root: Optional[Path],
+        height: int,
+        width: int,
+        min_depth: float,
+        max_depth: float,
+        device: str,
+        output_mode: str,
+    ) -> None:
+        self.name = name
+        self.weights_folder = weights_folder
+        self.height = height
+        self.width = width
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.device_name = device
+        self.output_mode = output_mode
+
+        prepare_import_path(code_root, purge_prefixes=["networks", "layers"])
+
+        try:
+            import torch
+            import networks
+            from layers import disp_to_depth
+        except Exception as exc:  # pragma: no cover - depends on the VM repo.
+            raise RuntimeError(
+                "Could not import MonoViT networks/layers. Pass "
+                "--model_code_roots MonoViT=/path/to/MonoViT."
+            ) from exc
+
+        self.torch = torch
+        self.disp_to_depth = disp_to_depth
+        self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+
+        encoder_path = weights_folder / "encoder.pth"
+        decoder_path = weights_folder / "depth.pth"
+        if not encoder_path.is_file() or not decoder_path.is_file():
+            raise FileNotFoundError(
+                f"{name}: expected encoder.pth and depth.pth inside {weights_folder}"
+            )
+
+        if not hasattr(networks, "mpvit_small"):
+            raise RuntimeError(f"{name}: networks.mpvit_small is not available in {code_root}")
+
+        self.encoder = networks.mpvit_small()
+        self.encoder.num_ch_enc = [64, 128, 216, 288, 288]
+        self.depth_decoder = networks.DepthDecoder()
+
+        encoder_dict = self._unwrap_state_dict(self._load_torch_file(encoder_path))
+        decoder_dict = self._unwrap_state_dict(self._load_torch_file(decoder_path))
+        if isinstance(encoder_dict, dict):
+            self.height = int(encoder_dict.get("height", self.height))
+            self.width = int(encoder_dict.get("width", self.width))
+        self._load_partial(self.encoder, encoder_dict, model_name=f"{name}/encoder")
+        self._load_partial(self.depth_decoder, decoder_dict, model_name=f"{name}/depth")
+
+        self.encoder.to(self.device).eval()
+        self.depth_decoder.to(self.device).eval()
+
+
+class EndoDacPredictor(Monodepth2Predictor):
+    def __init__(
+        self,
+        name: str,
+        weights_folder: Path,
+        code_root: Optional[Path],
+        height: int,
+        width: int,
+        min_depth: float,
+        max_depth: float,
+        device: str,
+        output_mode: str,
+        pretrained_path: Optional[Path],
+    ) -> None:
+        self.name = name
+        self.weights_folder = weights_folder
+        self.height = height
+        self.width = width
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.device_name = device
+        self.output_mode = output_mode
+
+        prepare_import_path(code_root, purge_prefixes=["models", "utils"])
+
+        try:
+            import torch
+            import models.endodac as endodac
+            from utils.layers import disp_to_depth
+        except Exception as exc:  # pragma: no cover - depends on the VM repo.
+            raise RuntimeError(
+                "Could not import ENDO-DAC modules. Pass "
+                "--model_code_roots ENDO-DAC=/workspace/ENDO-DAC."
+            ) from exc
+
+        self.torch = torch
+        self.disp_to_depth = disp_to_depth
+        self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+
+        depther_path = weights_folder / "depth_model.pth"
+        if not depther_path.is_file():
+            raise FileNotFoundError(f"{name}: expected depth_model.pth inside {weights_folder}")
+        depther_dict = self._unwrap_state_dict(self._load_torch_file(depther_path))
+        if isinstance(depther_dict, dict):
+            self.height = int(depther_dict.get("height", self.height))
+            self.width = int(depther_dict.get("width", self.width))
+
+        if pretrained_path is None and code_root is not None:
+            pretrained_path = code_root / "pretrained_model"
+        if pretrained_path is None:
+            pretrained_path = weights_folder
+
+        self.depther = endodac.endodac(
+            backbone_size="base",
+            r=4,
+            lora_type="dvlora",
+            image_shape=(224, 280),
+            pretrained_path=str(pretrained_path),
+            residual_block_indexes=[2, 5, 8, 11],
+            include_cls_token=True,
+        )
+        self._load_partial(self.depther, depther_dict, model_name=f"{name}/depth_model")
+        self.depther.to(self.device).eval()
+
+    def predict(self, rgb: Image.Image) -> np.ndarray:
+        image = rgb.convert("RGB").resize((self.width, self.height), Image.LANCZOS)
+        arr = np.asarray(image).astype(np.float32) / 255.0
+        tensor = self.torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
+
+        with self.torch.no_grad():
+            output = self.depther(tensor)
+            disp = output[("disp", 0)]
+            scaled_disp, depth = self.disp_to_depth(disp, self.min_depth, self.max_depth)
+            pred = depth[0, 0].detach().cpu().numpy() if self.output_mode == "depth" else scaled_disp[0, 0].detach().cpu().numpy()
+
+        pred_img = Image.fromarray(pred.astype(np.float32), mode="F")
+        pred_img = pred_img.resize(rgb.size, Image.BILINEAR)
+        return np.asarray(pred_img).astype(np.float32)
+
+
+class ManyDepthPredictor(Monodepth2Predictor):
+    def __init__(
+        self,
+        name: str,
+        weights_folder: Path,
+        code_root: Optional[Path],
+        height: int,
+        width: int,
+        min_depth: float,
+        max_depth: float,
+        device: str,
+        output_mode: str,
+        mode: str,
+    ) -> None:
+        self.name = name
+        self.weights_folder = weights_folder
+        self.height = height
+        self.width = width
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.device_name = device
+        self.output_mode = output_mode
+        self.mode = mode
+
+        if code_root is not None and code_root.name.lower() == "manydepth":
+            code_root = code_root.parent
+        prepare_import_path(code_root, purge_prefixes=["manydepth"])
+
+        try:
+            import torch
+            from manydepth import networks
+            from manydepth.layers import disp_to_depth
+        except Exception as exc:  # pragma: no cover - depends on the VM repo.
+            raise RuntimeError(
+                "Could not import manydepth. Pass --model_code_roots "
+                "ManyDepth=/workspace/endo-manydepth/endo-manydepth-master."
+            ) from exc
+
+        self.torch = torch
+        self.disp_to_depth = disp_to_depth
+        self.device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+
+        encoder_path = weights_folder / "encoder.pth"
+        decoder_path = weights_folder / "depth.pth"
+        if not encoder_path.is_file() or not decoder_path.is_file():
+            raise FileNotFoundError(
+                f"{name}: expected encoder.pth and depth.pth inside {weights_folder}"
+            )
+
+        encoder_dict = self._unwrap_state_dict(self._load_torch_file(encoder_path))
+        self.feed_height = int(encoder_dict.get("height", height))
+        self.feed_width = int(encoder_dict.get("width", width))
+        min_bin = float(encoder_dict.get("min_depth_bin", 0.1))
+        max_bin = float(encoder_dict.get("max_depth_bin", 20.0))
+
+        self.encoder = networks.ResnetEncoderMatching(
+            18,
+            False,
+            input_width=self.feed_width,
+            input_height=self.feed_height,
+            adaptive_bins=True,
+            min_depth_bin=min_bin,
+            max_depth_bin=max_bin,
+            depth_binning="linear",
+            num_depth_bins=96,
+        )
+        self.depth_decoder = networks.DepthDecoder(num_ch_enc=self.encoder.num_ch_enc, scales=range(4))
+
+        decoder_dict = self._unwrap_state_dict(self._load_torch_file(decoder_path))
+        self._load_partial(self.encoder, encoder_dict, model_name=f"{name}/encoder")
+        self._load_partial(self.depth_decoder, decoder_dict, model_name=f"{name}/depth")
+
+        self.encoder.to(self.device).eval()
+        self.depth_decoder.to(self.device).eval()
+        self.min_depth_bin = min_bin
+        self.max_depth_bin = max_bin
+
+    def predict(self, rgb: Image.Image) -> np.ndarray:
+        image = rgb.convert("RGB").resize((self.feed_width, self.feed_height), Image.LANCZOS)
+        arr = np.asarray(image).astype(np.float32) / 255.0
+        input_image = self.torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
+
+        source = self.torch.zeros_like(input_image).unsqueeze(1)
+        pose = self.torch.zeros((1, 1, 4, 4), dtype=input_image.dtype, device=self.device)
+        pose[:, :, 0, 0] = 1.0
+        pose[:, :, 1, 1] = 1.0
+        pose[:, :, 2, 2] = 1.0
+        pose[:, :, 3, 3] = 1.0
+
+        k_np = np.eye(4, dtype=np.float32)
+        k_np[0, 0] = self.feed_width / 4.0
+        k_np[1, 1] = self.feed_height / 4.0
+        k_np[0, 2] = self.feed_width / 8.0
+        k_np[1, 2] = self.feed_height / 8.0
+        k = self.torch.from_numpy(k_np).unsqueeze(0).to(self.device)
+        inv_k = self.torch.inverse(k)
+
+        with self.torch.no_grad():
+            output, _, _ = self.encoder(
+                current_image=input_image,
+                lookup_images=source,
+                poses=pose,
+                K=k,
+                invK=inv_k,
+                min_depth_bin=self.min_depth_bin,
+                max_depth_bin=self.max_depth_bin,
+            )
+            output = self.depth_decoder(output)
+            disp = output[("disp", 0)]
+            scaled_disp, depth = self.disp_to_depth(disp, self.min_depth, self.max_depth)
+            pred = depth[0, 0].detach().cpu().numpy() if self.output_mode == "depth" else scaled_disp[0, 0].detach().cpu().numpy()
 
         pred_img = Image.fromarray(pred.astype(np.float32), mode="F")
         pred_img = pred_img.resize(rgb.size, Image.BILINEAR)
@@ -259,6 +573,27 @@ def parse_args() -> argparse.Namespace:
             "[{\"name\":\"MonoDepth2\",\"kind\":\"monodepth2\",\"path\":\"/w\"}]."
         ),
     )
+    parser.add_argument(
+        "--model_types",
+        nargs="*",
+        default=[],
+        metavar="NAME=TYPE",
+        help="Optional per-model type: monodepth2, monovit, endodac, manydepth.",
+    )
+    parser.add_argument(
+        "--model_code_roots",
+        nargs="*",
+        default=[],
+        metavar="NAME=CODE_ROOT",
+        help="Optional per-model code root, e.g. ENDO-DAC=/workspace/ENDO-DAC.",
+    )
+    parser.add_argument(
+        "--endodac_pretrained_paths",
+        nargs="*",
+        default=[],
+        metavar="NAME=PATH",
+        help="Optional ENDO-DAC pretrained_model folder per model.",
+    )
 
     parser.add_argument(
         "--code_root",
@@ -276,6 +611,12 @@ def parse_args() -> argparse.Namespace:
         choices=["disp", "depth"],
         default="disp",
         help="What to visualize from monodepth2-style models.",
+    )
+    parser.add_argument(
+        "--manydepth_mode",
+        choices=["mono"],
+        default="mono",
+        help="ManyDepth qualitative mode. Mono uses a zero cost volume for single-frame figures.",
     )
 
     parser.add_argument("--split_file", default=None)
@@ -345,6 +686,35 @@ def parse_key_value_specs(values: Iterable[str], kind: str) -> list[ModelSpec]:
     return specs
 
 
+def parse_name_map(values: Iterable[str]) -> dict[str, str]:
+    mapping = {}
+    for item in values:
+        if "=" not in item:
+            raise ValueError(f"Expected NAME=VALUE, got: {item}")
+        name, value = item.split("=", 1)
+        name = normalize_match_text(name)
+        value = value.strip()
+        if not name or not value:
+            raise ValueError(f"Expected NAME=VALUE, got: {item}")
+        mapping[name] = value
+    return mapping
+
+
+def infer_model_kind(spec: ModelSpec, explicit_types: dict[str, str]) -> str:
+    key = normalize_match_text(spec.name)
+    if key in explicit_types:
+        return explicit_types[key].strip().lower()
+
+    joined = normalize_match_text(f"{spec.name} {spec.path}")
+    if "endodac" in joined:
+        return "endodac"
+    if "monovit" in joined:
+        return "monovit"
+    if "manydepth" in joined:
+        return "manydepth"
+    return spec.kind
+
+
 def load_model_specs(args: argparse.Namespace) -> list[ModelSpec]:
     specs = []
     specs.extend(parse_key_value_specs(args.models, "monodepth2"))
@@ -366,6 +736,11 @@ def load_model_specs(args: argparse.Namespace) -> list[ModelSpec]:
 
     if not specs:
         raise ValueError("Add at least one --models or --prediction_roots entry.")
+
+    explicit_types = parse_name_map(args.model_types)
+    for spec in specs:
+        if spec.kind != "predictions":
+            spec.kind = infer_model_kind(spec, explicit_types)
     return specs
 
 
@@ -777,8 +1152,12 @@ def display_label(corruption: str) -> str:
     return DISPLAY_LABELS.get(corruption.lower(), corruption.replace("_", " ").title())
 
 
-def valid_weights_folder(path: Path) -> bool:
-    return path.is_dir() and (path / "encoder.pth").is_file() and (path / "depth.pth").is_file()
+def valid_weights_folder(path: Path, kind: str = "monodepth2") -> bool:
+    if not path.is_dir():
+        return False
+    if kind == "endodac":
+        return (path / "depth_model.pth").is_file()
+    return (path / "encoder.pth").is_file() and (path / "depth.pth").is_file()
 
 
 def normalize_match_text(value: str) -> str:
@@ -827,13 +1206,13 @@ def candidate_score(candidate: Path, spec: ModelSpec) -> int:
     return score
 
 
-def find_valid_weight_dirs(root: Path) -> list[Path]:
+def find_valid_weight_dirs(root: Path, kind: str = "monodepth2") -> list[Path]:
     if not root.is_dir():
         return []
     found = []
     for current_root, dirs, files in os.walk(root):
         current = Path(current_root)
-        if "encoder.pth" in files and "depth.pth" in files:
+        if valid_weights_folder(current, kind):
             found.append(current)
             dirs[:] = []
     return found
@@ -869,11 +1248,11 @@ def safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
 
 def resolve_backup_weights_folder(spec: ModelSpec, args: argparse.Namespace) -> Path:
     original = spec.path.expanduser()
-    if valid_weights_folder(original):
+    if valid_weights_folder(original, spec.kind):
         return original
 
     if original.is_dir():
-        nested = find_valid_weight_dirs(original)
+        nested = find_valid_weight_dirs(original, spec.kind)
         best_nested = pick_best_candidate(nested, spec) or (nested[0] if nested else None)
         if best_nested is not None:
             print(f"[INFO] {spec.name}: using nested weights folder {best_nested}")
@@ -883,7 +1262,7 @@ def resolve_backup_weights_folder(spec: ModelSpec, args: argparse.Namespace) -> 
     if backup_root is None or not backup_root.is_dir():
         return original
 
-    best_dir = pick_best_scored_candidate(find_valid_weight_dirs(backup_root), spec)
+    best_dir = pick_best_scored_candidate(find_valid_weight_dirs(backup_root, spec.kind), spec)
     zip_candidates = [p for p in backup_root.glob("*.zip") if p.is_file()]
     best_zip = pick_best_scored_candidate(zip_candidates, spec)
 
@@ -900,11 +1279,11 @@ def resolve_backup_weights_folder(spec: ModelSpec, args: argparse.Namespace) -> 
         else backup_root / "_extracted"
     )
     extract_dir = extract_root / best_zip[1].stem
-    valid_inside = find_valid_weight_dirs(extract_dir)
+    valid_inside = find_valid_weight_dirs(extract_dir, spec.kind)
     if not valid_inside:
         print(f"[INFO] {spec.name}: extracting backup {best_zip[1]} -> {extract_dir}")
         safe_extract_zip(best_zip[1], extract_dir)
-        valid_inside = find_valid_weight_dirs(extract_dir)
+        valid_inside = find_valid_weight_dirs(extract_dir, spec.kind)
 
     best_inside = pick_best_candidate(valid_inside, spec) or (valid_inside[0] if valid_inside else None)
     if best_inside is not None:
@@ -916,23 +1295,84 @@ def resolve_backup_weights_folder(spec: ModelSpec, args: argparse.Namespace) -> 
 
 def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
     predictors = {}
-    code_root = Path(args.code_root).expanduser() if args.code_root else None
+    global_code_root = Path(args.code_root).expanduser() if args.code_root else None
+    code_root_map = {
+        key: Path(value).expanduser()
+        for key, value in parse_name_map(args.model_code_roots).items()
+    }
+    endodac_pretrained_map = {
+        key: Path(value).expanduser()
+        for key, value in parse_name_map(args.endodac_pretrained_paths).items()
+    }
+
     for spec in specs:
-        if spec.kind == "monodepth2":
+        model_key = normalize_match_text(spec.name)
+        code_root = code_root_map.get(model_key, global_code_root)
+        if code_root is None and spec.kind == "endodac":
+            for parent in [spec.path, *spec.path.parents]:
+                if parent.name == "ENDO-DAC":
+                    code_root = parent
+                    break
+        if code_root is None and spec.kind == "manydepth":
+            for parent in [spec.path, *spec.path.parents]:
+                if parent.name.lower() == "manydepth":
+                    code_root = parent.parent
+                    break
+
+        if spec.kind in {"monodepth2", "monovit", "endodac", "manydepth"}:
             spec.path = resolve_backup_weights_folder(spec, args)
             try:
-                predictors[spec.name] = Monodepth2Predictor(
-                    name=spec.name,
-                    weights_folder=spec.path,
-                    code_root=code_root,
-                    num_layers=args.num_layers,
-                    height=args.height,
-                    width=args.width,
-                    min_depth=args.min_depth,
-                    max_depth=args.max_depth,
-                    device=args.device,
-                    output_mode=args.model_output,
-                )
+                if spec.kind == "monovit":
+                    predictors[spec.name] = MonoViTPredictor(
+                        name=spec.name,
+                        weights_folder=spec.path,
+                        code_root=code_root,
+                        height=args.height,
+                        width=args.width,
+                        min_depth=args.min_depth,
+                        max_depth=args.max_depth,
+                        device=args.device,
+                        output_mode=args.model_output,
+                    )
+                elif spec.kind == "endodac":
+                    predictors[spec.name] = EndoDacPredictor(
+                        name=spec.name,
+                        weights_folder=spec.path,
+                        code_root=code_root,
+                        height=args.height,
+                        width=args.width,
+                        min_depth=args.min_depth,
+                        max_depth=args.max_depth,
+                        device=args.device,
+                        output_mode=args.model_output,
+                        pretrained_path=endodac_pretrained_map.get(model_key),
+                    )
+                elif spec.kind == "manydepth":
+                    predictors[spec.name] = ManyDepthPredictor(
+                        name=spec.name,
+                        weights_folder=spec.path,
+                        code_root=code_root,
+                        height=args.height,
+                        width=args.width,
+                        min_depth=args.min_depth,
+                        max_depth=args.max_depth,
+                        device=args.device,
+                        output_mode=args.model_output,
+                        mode=args.manydepth_mode,
+                    )
+                else:
+                    predictors[spec.name] = Monodepth2Predictor(
+                        name=spec.name,
+                        weights_folder=spec.path,
+                        code_root=code_root,
+                        num_layers=args.num_layers,
+                        height=args.height,
+                        width=args.width,
+                        min_depth=args.min_depth,
+                        max_depth=args.max_depth,
+                        device=args.device,
+                        output_mode=args.model_output,
+                    )
             except Exception as exc:
                 if args.missing_policy == "error":
                     raise
