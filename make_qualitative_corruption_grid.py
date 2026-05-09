@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import inspect
 import json
 import os
+import pkgutil
 import re
 import sys
 import zipfile
@@ -229,7 +232,7 @@ class Monodepth2Predictor:
                 out.append(candidate)
         return out
 
-    def _load_partial(self, model, state_dict, model_name: str) -> None:
+    def _match_state_dict(self, model, state_dict, model_name: str):
         state_dict = self._strip_module_prefix(state_dict)
         if not isinstance(state_dict, dict):
             raise RuntimeError(f"{model_name}: checkpoint is not a state dict")
@@ -262,11 +265,11 @@ class Monodepth2Predictor:
                 continue
         if not filtered:
             raise RuntimeError(f"{model_name}: no checkpoint keys matched the model")
-        result = model.load_state_dict(filtered, strict=False)
-        missing_keys = list(getattr(result, "missing_keys", []))
+        missing_keys = [key for key in model_dict.keys() if key not in filtered]
         unexpected_keys = [k for k in state_dict.keys() if k not in source_matched]
         audit = {
             "module": model_name,
+            "class": model.__class__.__name__,
             "checkpoint_keys": len(state_dict),
             "model_keys": len(model_dict),
             "loaded_keys": len(filtered),
@@ -277,6 +280,13 @@ class Monodepth2Predictor:
             "unexpected_checkpoint_keys_sample": unexpected_keys[:12],
             "shape_mismatches_sample": shape_mismatches,
         }
+        return filtered, audit
+
+    def _load_partial(self, model, state_dict, model_name: str) -> None:
+        filtered, audit = self._match_state_dict(model, state_dict, model_name)
+        result = model.load_state_dict(filtered, strict=False)
+        audit["missing_model_keys_sample"] = list(getattr(result, "missing_keys", []))[:12]
+        audit["unexpected_checkpoint_keys_sample"] = list(getattr(result, "unexpected_keys", []))[:12]
         if not hasattr(self, "load_audit"):
             self.load_audit = []
         self.load_audit.append(audit)
@@ -351,23 +361,104 @@ class MonoViTPredictor(Monodepth2Predictor):
         if not hasattr(networks, "mpvit_small"):
             raise RuntimeError(f"{name}: networks.mpvit_small is not available in {code_root}")
 
-        self.encoder = networks.mpvit_small()
-        self.encoder.num_ch_enc = [64, 128, 216, 288, 288]
-        try:
-            self.depth_decoder = networks.DepthDecoder(self.encoder.num_ch_enc, scales=range(4))
-        except TypeError:
-            self.depth_decoder = networks.DepthDecoder()
-
         encoder_dict = self._unwrap_state_dict(self._load_torch_file(encoder_path))
         decoder_dict = self._unwrap_state_dict(self._load_torch_file(decoder_path))
+        self.encoder = networks.mpvit_small()
+        self.encoder.num_ch_enc = [64, 128, 216, 288, 288]
         if isinstance(encoder_dict, dict):
             self.height = int(encoder_dict.get("height", self.height))
             self.width = int(encoder_dict.get("width", self.width))
+        self.depth_decoder = self._build_best_decoder(networks, decoder_dict, name)
         self._load_partial(self.encoder, encoder_dict, model_name=f"{name}/encoder")
-        self._load_partial(self.depth_decoder, decoder_dict, model_name=f"{name}/depth")
 
         self.encoder.to(self.device).eval()
         self.depth_decoder.to(self.device).eval()
+
+    def _decoder_constructors(self, networks):
+        classes = []
+        modules = [networks]
+        if hasattr(networks, "__path__"):
+            for module_info in pkgutil.iter_modules(networks.__path__):
+                try:
+                    modules.append(importlib.import_module(f"{networks.__name__}.{module_info.name}"))
+                except Exception:
+                    continue
+
+        seen = set()
+        for module in modules:
+            for attr_name in dir(module):
+                if "decoder" not in attr_name.lower():
+                    continue
+                obj = getattr(module, attr_name)
+                if not inspect.isclass(obj):
+                    continue
+                try:
+                    if not issubclass(obj, self.torch.nn.Module):
+                        continue
+                except TypeError:
+                    continue
+                key = f"{obj.__module__}.{obj.__name__}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                classes.append((obj.__name__, obj))
+
+        classes.sort(key=lambda item: (item[0] != "DepthDecoder", item[0]))
+
+        attempts = []
+        for class_name, cls in classes:
+            attempts.extend(
+                [
+                    (class_name, lambda cls=cls: cls(self.encoder.num_ch_enc, scales=range(4))),
+                    (class_name, lambda cls=cls: cls(num_ch_enc=self.encoder.num_ch_enc, scales=range(4))),
+                    (class_name, lambda cls=cls: cls(self.encoder.num_ch_enc)),
+                    (class_name, lambda cls=cls: cls(num_ch_enc=self.encoder.num_ch_enc)),
+                    (class_name, lambda cls=cls: cls(scales=range(4))),
+                    (class_name, lambda cls=cls: cls()),
+                ]
+            )
+        return attempts
+
+    def _build_best_decoder(self, networks, decoder_dict, name: str):
+        best = None
+        failures = []
+        for class_name, ctor in self._decoder_constructors(networks):
+            try:
+                decoder = ctor()
+                filtered, audit = self._match_state_dict(
+                    decoder,
+                    decoder_dict,
+                    model_name=f"{name}/depth[{class_name}]",
+                )
+            except Exception as exc:
+                if len(failures) < 8:
+                    failures.append(f"{class_name}: {exc}")
+                continue
+
+            score = (
+                audit["loaded_keys"],
+                -audit["missing_model_keys"],
+                -audit["shape_mismatch_count"],
+                -audit["unexpected_checkpoint_keys"],
+            )
+            if best is None or score > best[0]:
+                best = (score, class_name, decoder, filtered, audit)
+
+        if best is None:
+            raise RuntimeError(
+                f"{name}: no decoder class matched depth.pth. Tried: {failures}"
+            )
+
+        _, class_name, decoder, filtered, audit = best
+        decoder.load_state_dict(filtered, strict=False)
+        audit["module"] = f"{name}/depth"
+        audit["selected_decoder_class"] = class_name
+        self.load_audit.append(audit)
+        print(
+            f"[INFO] {name}: selected decoder {class_name} "
+            f"({audit['loaded_keys']}/{audit['model_keys']} keys loaded)"
+        )
+        return decoder
 
 
 class EndoDacPredictor(Monodepth2Predictor):
