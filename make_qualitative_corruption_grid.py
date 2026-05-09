@@ -300,6 +300,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--caption", default=None)
     parser.add_argument("--save_metadata", action="store_true")
+    parser.add_argument(
+        "--wandb_project",
+        default=None,
+        help="If set, log the generated grid to this Weights & Biases project.",
+    )
+    parser.add_argument("--wandb_entity", default=None)
+    parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument("--wandb_group", default=None)
+    parser.add_argument(
+        "--wandb_key",
+        default="qualitative_corruption_grid",
+        help="Metric/media key used when logging the grid image.",
+    )
     return parser.parse_args()
 
 
@@ -773,6 +786,48 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
     return predictors
 
 
+def log_grid_to_wandb(
+    args: argparse.Namespace,
+    output_path: Path,
+    metadata: dict,
+) -> None:
+    if not args.wandb_project:
+        return
+
+    try:
+        import wandb
+    except Exception as exc:
+        raise RuntimeError(
+            "wandb is not installed in this environment. Install it or omit "
+            "--wandb_project."
+        ) from exc
+
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name or output_path.stem,
+        group=args.wandb_group,
+        config={
+            "corruptions_root": metadata["corruptions_root"],
+            "severity": metadata["severity"],
+            "reference_rel": metadata["reference_rel"],
+            "models": metadata["models"],
+            "output": str(output_path),
+            "cmap": args.cmap,
+            "normalize_low": args.normalize_low,
+            "normalize_high": args.normalize_high,
+        },
+    )
+
+    caption = args.caption or (
+        f"SCARED corruptions | severity={metadata['severity']} | "
+        f"frame={metadata['reference_rel']}"
+    )
+    wandb.log({args.wandb_key: wandb.Image(str(output_path), caption=caption)})
+    wandb.save(str(output_path))
+    run.finish()
+
+
 def main() -> None:
     args = parse_args()
     corruptions_root = Path(args.corruptions_root).expanduser()
@@ -914,6 +969,7 @@ def main() -> None:
             json.dump(metadata, f, indent=2)
         print(f"Saved metadata: {meta_path}")
 
+    log_grid_to_wandb(args, output_path, metadata)
     print(f"Saved grid: {output_path}")
 
 
