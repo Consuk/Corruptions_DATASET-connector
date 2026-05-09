@@ -358,23 +358,39 @@ class MonoViTPredictor(Monodepth2Predictor):
                 f"{name}: expected encoder.pth and depth.pth inside {weights_folder}"
             )
 
-        if not hasattr(networks, "mpvit_small"):
-            raise RuntimeError(f"{name}: networks.mpvit_small is not available in {code_root}")
-
         encoder_dict = self._unwrap_state_dict(self._load_torch_file(encoder_path))
         decoder_dict = self._unwrap_state_dict(self._load_torch_file(decoder_path))
-        self.encoder = networks.mpvit_small()
-        self.encoder.num_ch_enc = [64, 128, 216, 288, 288]
         if isinstance(encoder_dict, dict):
             self.height = int(encoder_dict.get("height", self.height))
             self.width = int(encoder_dict.get("width", self.width))
-        self.depth_decoder = self._build_best_decoder(networks, decoder_dict, name)
-        self._load_partial(self.encoder, encoder_dict, model_name=f"{name}/encoder")
 
+        self.encoder, self.depth_decoder = self._build_best_pair(
+            networks=networks,
+            encoder_dict=encoder_dict,
+            decoder_dict=decoder_dict,
+            name=name,
+        )
         self.encoder.to(self.device).eval()
         self.depth_decoder.to(self.device).eval()
 
-    def _decoder_constructors(self, networks):
+    def _encoder_constructors(self, networks):
+        constructors = []
+        for attr_name in dir(networks):
+            if "mpvit" not in attr_name.lower():
+                continue
+            obj = getattr(networks, attr_name)
+            if not callable(obj):
+                continue
+            constructors.extend(
+                [
+                    (attr_name, lambda obj=obj: obj()),
+                    (attr_name, lambda obj=obj: obj(pretrained=False)),
+                    (attr_name, lambda obj=obj: obj(pretrained=None)),
+                ]
+            )
+        return constructors
+
+    def _decoder_constructors(self, networks, num_ch_enc):
         classes = []
         modules = [networks]
         if hasattr(networks, "__path__"):
@@ -409,20 +425,81 @@ class MonoViTPredictor(Monodepth2Predictor):
         for class_name, cls in classes:
             attempts.extend(
                 [
-                    (class_name, lambda cls=cls: cls(self.encoder.num_ch_enc, scales=range(4))),
-                    (class_name, lambda cls=cls: cls(num_ch_enc=self.encoder.num_ch_enc, scales=range(4))),
-                    (class_name, lambda cls=cls: cls(self.encoder.num_ch_enc)),
-                    (class_name, lambda cls=cls: cls(num_ch_enc=self.encoder.num_ch_enc)),
+                    (class_name, lambda cls=cls, n=num_ch_enc: cls(n, scales=range(4))),
+                    (class_name, lambda cls=cls, n=num_ch_enc: cls(num_ch_enc=n, scales=range(4))),
+                    (class_name, lambda cls=cls, n=num_ch_enc: cls(n)),
+                    (class_name, lambda cls=cls, n=num_ch_enc: cls(num_ch_enc=n)),
                     (class_name, lambda cls=cls: cls(scales=range(4))),
                     (class_name, lambda cls=cls: cls()),
                 ]
             )
         return attempts
 
-    def _build_best_decoder(self, networks, decoder_dict, name: str):
+    def _infer_num_ch_enc(self, encoder, fallback):
+        candidates = []
+        if hasattr(encoder, "num_ch_enc"):
+            value = list(getattr(encoder, "num_ch_enc"))
+            if value:
+                candidates.append(value)
+
+        dummy = self.torch.zeros((1, 3, self.height, self.width), dtype=self.torch.float32)
+        try:
+            encoder.eval()
+            with self.torch.no_grad():
+                features = encoder(dummy)
+            if isinstance(features, (list, tuple)):
+                chans = [int(x.shape[1]) for x in features if hasattr(x, "shape") and len(x.shape) >= 2]
+                if chans:
+                    candidates.append(chans)
+                    if len(chans) == 4:
+                        candidates.append([chans[0], *chans])
+                        candidates.append([*chans, chans[-1]])
+        except Exception:
+            pass
+
+        candidates.extend(
+            [
+                fallback,
+                [64, 128, 216, 288, 288],
+                [64, 64, 128, 216, 288],
+                [64, 128, 256, 512, 512],
+                [64, 64, 128, 256, 512],
+                [64, 128, 216, 288],
+                [64, 128, 256, 512],
+            ]
+        )
+
+        unique = []
+        for item in candidates:
+            item = [int(x) for x in item if int(x) > 0]
+            if item and item not in unique:
+                unique.append(item)
+        return unique
+
+    def _try_forward_pair(self, encoder, decoder):
+        dummy = self.torch.zeros((1, 3, self.height, self.width), dtype=self.torch.float32)
+        encoder.eval()
+        decoder.eval()
+        with self.torch.no_grad():
+            features = encoder(dummy)
+            output = decoder(features)
+        if isinstance(output, dict) and ("disp", 0) in output:
+            return True, list(output[("disp", 0)].shape)
+        return False, str(type(output))
+
+    def _build_best_decoder(
+        self,
+        networks,
+        decoder_dict,
+        name: str,
+        num_ch_enc,
+        encoder_for_dry_run=None,
+        record: bool = True,
+        announce: bool = True,
+    ):
         best = None
         failures = []
-        for class_name, ctor in self._decoder_constructors(networks):
+        for class_name, ctor in self._decoder_constructors(networks, num_ch_enc):
             try:
                 decoder = ctor()
                 filtered, audit = self._match_state_dict(
@@ -430,6 +507,12 @@ class MonoViTPredictor(Monodepth2Predictor):
                     decoder_dict,
                     model_name=f"{name}/depth[{class_name}]",
                 )
+                out_info = None
+                if encoder_for_dry_run is not None:
+                    decoder.load_state_dict(filtered, strict=False)
+                    ok, out_info = self._try_forward_pair(encoder_for_dry_run, decoder)
+                    if not ok:
+                        raise RuntimeError(f"decoder output invalid: {out_info}")
             except Exception as exc:
                 if len(failures) < 8:
                     failures.append(f"{class_name}: {exc}")
@@ -442,23 +525,104 @@ class MonoViTPredictor(Monodepth2Predictor):
                 -audit["unexpected_checkpoint_keys"],
             )
             if best is None or score > best[0]:
-                best = (score, class_name, decoder, filtered, audit)
+                best = (score, class_name, decoder, filtered, audit, out_info)
 
         if best is None:
             raise RuntimeError(
                 f"{name}: no decoder class matched depth.pth. Tried: {failures}"
             )
 
-        _, class_name, decoder, filtered, audit = best
+        _, class_name, decoder, filtered, audit, out_info = best
         decoder.load_state_dict(filtered, strict=False)
         audit["module"] = f"{name}/depth"
         audit["selected_decoder_class"] = class_name
-        self.load_audit.append(audit)
-        print(
-            f"[INFO] {name}: selected decoder {class_name} "
-            f"({audit['loaded_keys']}/{audit['model_keys']} keys loaded)"
-        )
+        if out_info is not None:
+            audit["dry_run_output_shape"] = out_info
+        if record:
+            self.load_audit.append(audit)
+        if announce:
+            print(
+                f"[INFO] {name}: selected decoder {class_name} "
+                f"({audit['loaded_keys']}/{audit['model_keys']} keys loaded)"
+            )
         return decoder
+
+    def _build_best_pair(self, networks, encoder_dict, decoder_dict, name: str):
+        best = None
+        failures = []
+        encoder_ctors = self._encoder_constructors(networks)
+        if not encoder_ctors:
+            raise RuntimeError(f"{name}: no mpvit encoder constructors found in networks")
+
+        for encoder_name, encoder_ctor in encoder_ctors:
+            try:
+                encoder = encoder_ctor()
+                if not isinstance(encoder, self.torch.nn.Module):
+                    continue
+                fallback = list(getattr(encoder, "num_ch_enc", [64, 128, 216, 288, 288]))
+                enc_filtered, enc_audit = self._match_state_dict(
+                    encoder,
+                    encoder_dict,
+                    model_name=f"{name}/encoder[{encoder_name}]",
+                )
+                encoder.load_state_dict(enc_filtered, strict=False)
+            except Exception as exc:
+                if len(failures) < 12:
+                    failures.append(f"{encoder_name}: {exc}")
+                continue
+
+            for num_ch_enc in self._infer_num_ch_enc(encoder, fallback):
+                try:
+                    encoder.num_ch_enc = num_ch_enc
+                    decoder = self._build_best_decoder(
+                        networks,
+                        decoder_dict,
+                        name,
+                        num_ch_enc,
+                        encoder_for_dry_run=encoder,
+                        record=False,
+                        announce=False,
+                    )
+                except Exception as exc:
+                    if len(failures) < 12:
+                        failures.append(f"{encoder_name}/{num_ch_enc}: {exc}")
+                    continue
+
+                _, dec_audit = self._match_state_dict(
+                    decoder,
+                    decoder_dict,
+                    model_name=f"{name}/depth",
+                )
+                ok, out_info = self._try_forward_pair(encoder, decoder)
+                if not ok:
+                    continue
+                enc_audit["module"] = f"{name}/encoder"
+                enc_audit["selected_encoder_class"] = encoder_name
+                enc_audit["num_ch_enc"] = num_ch_enc
+                dec_audit["num_ch_enc"] = num_ch_enc
+                dec_audit["selected_decoder_class"] = decoder.__class__.__name__
+                dec_audit["dry_run_output_shape"] = out_info
+                score = (
+                    dec_audit["loaded_keys"],
+                    enc_audit["loaded_keys"],
+                    -dec_audit["missing_model_keys"],
+                    -dec_audit["shape_mismatch_count"],
+                )
+                if best is None or score > best[0]:
+                    best = (score, encoder_name, encoder, decoder, enc_audit, dec_audit)
+
+        if best is None:
+            raise RuntimeError(f"{name}: no encoder/decoder pair could run. Tried: {failures}")
+
+        _, encoder_name, encoder, decoder, enc_audit, dec_audit = best
+        self.load_audit.append(dec_audit)
+        self.load_audit.append(enc_audit)
+        print(
+            f"[INFO] {name}: selected encoder {encoder_name}, decoder "
+            f"{dec_audit.get('selected_decoder_class')} "
+            f"({dec_audit['loaded_keys']}/{dec_audit['model_keys']} decoder keys loaded)"
+        )
+        return encoder, decoder
 
 
 class EndoDacPredictor(Monodepth2Predictor):
