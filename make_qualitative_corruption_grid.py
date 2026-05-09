@@ -314,7 +314,10 @@ class MonoViTPredictor(Monodepth2Predictor):
 
         self.encoder = networks.mpvit_small()
         self.encoder.num_ch_enc = [64, 128, 216, 288, 288]
-        self.depth_decoder = networks.DepthDecoder()
+        try:
+            self.depth_decoder = networks.DepthDecoder(self.encoder.num_ch_enc, scales=range(4))
+        except TypeError:
+            self.depth_decoder = networks.DepthDecoder()
 
         encoder_dict = self._unwrap_state_dict(self._load_torch_file(encoder_path))
         decoder_dict = self._unwrap_state_dict(self._load_torch_file(decoder_path))
