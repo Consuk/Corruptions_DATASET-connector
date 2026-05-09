@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -225,6 +227,19 @@ def parse_args() -> argparse.Namespace:
         default=[],
         metavar="NAME=WEIGHTS_FOLDER",
         help="Monodepth2-style weights folders containing encoder.pth and depth.pth.",
+    )
+    parser.add_argument(
+        "--weights_backup_root",
+        default="/workspace/weight",
+        help=(
+            "Fallback directory with weight folders or .zip backups. Used only "
+            "when a --models path is missing or does not contain encoder.pth/depth.pth."
+        ),
+    )
+    parser.add_argument(
+        "--weights_extract_root",
+        default=None,
+        help="Where backup .zip files are extracted. Defaults to BACKUP_ROOT/_extracted.",
     )
     parser.add_argument(
         "--prediction_roots",
@@ -762,11 +777,141 @@ def display_label(corruption: str) -> str:
     return DISPLAY_LABELS.get(corruption.lower(), corruption.replace("_", " ").title())
 
 
+def valid_weights_folder(path: Path) -> bool:
+    return path.is_dir() and (path / "encoder.pth").is_file() and (path / "depth.pth").is_file()
+
+
+def normalize_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def model_aliases(name: str) -> list[str]:
+    key = normalize_match_text(name)
+    aliases = [key]
+    known_aliases = {
+        "afsfmlearner": ["afmlearner", "afsfm", "sfmlearner"],
+        "afmlearner": ["afsfmlearner", "afsfm", "sfmlearner"],
+        "endosfmlearner": ["endosfmlearner", "scaredendo", "endosfm"],
+        "monodepth2": ["monodepth2", "m2"],
+        "monovit": ["monovit", "weights19monovit"],
+        "endodac": ["endodac", "dac"],
+        "manydepth": ["manydepth"],
+        "owners": ["owners", "monoiit", "own"],
+    }
+    for canonical, values in known_aliases.items():
+        if canonical in key or key in canonical or any(v in key for v in values):
+            aliases.extend([canonical, *values])
+
+    out = []
+    for alias in aliases:
+        alias = normalize_match_text(alias)
+        if alias and alias not in out:
+            out.append(alias)
+    return out
+
+
+def candidate_score(candidate: Path, spec: ModelSpec) -> int:
+    haystack = normalize_match_text(" ".join(candidate.parts[-4:]))
+    aliases = model_aliases(spec.name)
+    path_hint = normalize_match_text(spec.path.name)
+    score = 0
+    for alias in aliases:
+        if alias and alias in haystack:
+            score += 100 + len(alias)
+        elif alias and haystack in alias:
+            score += 20
+    if path_hint and path_hint in haystack:
+        score += 40
+    if candidate.suffix.lower() == ".zip":
+        score += 5
+    return score
+
+
+def find_valid_weight_dirs(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    found = []
+    for current_root, dirs, files in os.walk(root):
+        current = Path(current_root)
+        if "encoder.pth" in files and "depth.pth" in files:
+            found.append(current)
+            dirs[:] = []
+    return found
+
+
+def pick_best_candidate(candidates: list[Path], spec: ModelSpec) -> Optional[Path]:
+    scored = [(candidate_score(path, spec), path) for path in candidates]
+    scored = [(score, path) for score, path in scored if score > 0]
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (item[0], -len(str(item[1]))), reverse=True)
+    return scored[0][1]
+
+
+def safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    root = extract_dir.resolve()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            target = (extract_dir / member.filename).resolve()
+            if root != target and root not in target.parents:
+                raise RuntimeError(f"Unsafe path inside zip: {member.filename}")
+        zf.extractall(extract_dir)
+
+
+def resolve_backup_weights_folder(spec: ModelSpec, args: argparse.Namespace) -> Path:
+    original = spec.path.expanduser()
+    if valid_weights_folder(original):
+        return original
+
+    if original.is_dir():
+        nested = find_valid_weight_dirs(original)
+        best_nested = pick_best_candidate(nested, spec) or (nested[0] if nested else None)
+        if best_nested is not None:
+            print(f"[INFO] {spec.name}: using nested weights folder {best_nested}")
+            return best_nested
+
+    backup_root = Path(args.weights_backup_root).expanduser() if args.weights_backup_root else None
+    if backup_root is None or not backup_root.is_dir():
+        return original
+
+    backup_dirs = find_valid_weight_dirs(backup_root)
+    best_dir = pick_best_candidate(backup_dirs, spec)
+    if best_dir is not None:
+        print(f"[INFO] {spec.name}: path not found, using backup folder {best_dir}")
+        return best_dir
+
+    zip_candidates = [p for p in backup_root.glob("*.zip") if p.is_file()]
+    best_zip = pick_best_candidate(zip_candidates, spec)
+    if best_zip is None:
+        return original
+
+    extract_root = (
+        Path(args.weights_extract_root).expanduser()
+        if args.weights_extract_root
+        else backup_root / "_extracted"
+    )
+    extract_dir = extract_root / best_zip.stem
+    valid_inside = find_valid_weight_dirs(extract_dir)
+    if not valid_inside:
+        print(f"[INFO] {spec.name}: extracting backup {best_zip} -> {extract_dir}")
+        safe_extract_zip(best_zip, extract_dir)
+        valid_inside = find_valid_weight_dirs(extract_dir)
+
+    best_inside = pick_best_candidate(valid_inside, spec) or (valid_inside[0] if valid_inside else None)
+    if best_inside is not None:
+        print(f"[INFO] {spec.name}: using extracted backup weights {best_inside}")
+        return best_inside
+
+    return original
+
+
 def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
     predictors = {}
     code_root = Path(args.code_root).expanduser() if args.code_root else None
     for spec in specs:
         if spec.kind == "monodepth2":
+            spec.path = resolve_backup_weights_folder(spec, args)
             predictors[spec.name] = Monodepth2Predictor(
                 name=spec.name,
                 weights_folder=spec.path,
