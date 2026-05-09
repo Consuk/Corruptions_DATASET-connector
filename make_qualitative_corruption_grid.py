@@ -390,7 +390,81 @@ class MonoViTPredictor(Monodepth2Predictor):
             )
         return constructors
 
-    def _decoder_constructors(self, networks, num_ch_enc):
+    def _infer_flat_num_ch_dec(self, decoder_dict):
+        try:
+            return [
+                int(decoder_dict["decoder.8.conv.conv.weight"].shape[0]),
+                int(decoder_dict["decoder.6.conv.conv.weight"].shape[0]),
+                int(decoder_dict["decoder.4.conv.conv.weight"].shape[0]),
+                int(decoder_dict["decoder.2.conv.conv.weight"].shape[0]),
+                int(decoder_dict["decoder.0.conv.conv.weight"].shape[0]),
+            ]
+        except Exception:
+            return None
+
+    def _make_flat_depth_decoder(self, num_ch_enc, num_ch_dec, scales=range(4)):
+        torch = self.torch
+        nn = torch.nn
+        functional = torch.nn.functional
+
+        class Conv3x3(nn.Module):
+            def __init__(self, in_channels, out_channels):
+                super().__init__()
+                self.conv = nn.Conv2d(in_channels, out_channels, 3, 1, 1)
+
+            def forward(self, x):
+                return self.conv(x)
+
+        class ConvBlock(nn.Module):
+            def __init__(self, in_channels, out_channels):
+                super().__init__()
+                self.conv = Conv3x3(in_channels, out_channels)
+                self.nonlin = nn.ELU(inplace=True)
+
+            def forward(self, x):
+                return self.nonlin(self.conv(x))
+
+        class FlatDepthDecoder(nn.Module):
+            def __init__(self, num_ch_enc, num_ch_dec, scales):
+                super().__init__()
+                self.num_ch_enc = list(num_ch_enc)
+                self.num_ch_dec = list(num_ch_dec)
+                self.scales = list(scales)
+                self.use_skips = True
+                self.decoder = nn.ModuleList()
+
+                for i in range(4, -1, -1):
+                    num_ch_in = self.num_ch_enc[-1] if i == 4 else self.num_ch_dec[i + 1]
+                    num_ch_out = self.num_ch_dec[i]
+                    self.decoder.append(ConvBlock(num_ch_in, num_ch_out))
+
+                    num_ch_in = self.num_ch_dec[i]
+                    if self.use_skips and i > 0:
+                        num_ch_in += self.num_ch_enc[i - 1]
+                    self.decoder.append(ConvBlock(num_ch_in, num_ch_out))
+
+                for scale in self.scales:
+                    self.decoder.append(Conv3x3(self.num_ch_dec[scale], 1))
+                self.sigmoid = nn.Sigmoid()
+
+            def forward(self, input_features):
+                outputs = {}
+                x = input_features[-1]
+                for i in range(4, -1, -1):
+                    base = 2 * (4 - i)
+                    x = self.decoder[base](x)
+                    x = functional.interpolate(x, scale_factor=2, mode="nearest")
+                    if self.use_skips and i > 0:
+                        x = torch.cat([x, input_features[i - 1]], dim=1)
+                    x = self.decoder[base + 1](x)
+                    if i in self.scales:
+                        disp_idx = 10 + self.scales.index(i)
+                        outputs[("disp", i)] = self.sigmoid(self.decoder[disp_idx](x))
+                return outputs
+
+        return FlatDepthDecoder(num_ch_enc, num_ch_dec, scales)
+
+    def _decoder_constructors(self, networks, num_ch_enc, decoder_dict=None):
         classes = []
         modules = [networks]
         if hasattr(networks, "__path__"):
@@ -422,6 +496,15 @@ class MonoViTPredictor(Monodepth2Predictor):
         classes.sort(key=lambda item: (item[0] != "DepthDecoder", item[0]))
 
         attempts = []
+        inferred_num_ch_dec = self._infer_flat_num_ch_dec(decoder_dict or {})
+        if inferred_num_ch_dec is not None:
+            attempts.append(
+                (
+                    "FlatDepthDecoderFromCheckpoint",
+                    lambda n=num_ch_enc, d=inferred_num_ch_dec: self._make_flat_depth_decoder(n, d),
+                )
+            )
+
         for class_name, cls in classes:
             attempts.extend(
                 [
@@ -499,7 +582,7 @@ class MonoViTPredictor(Monodepth2Predictor):
     ):
         best = None
         failures = []
-        for class_name, ctor in self._decoder_constructors(networks, num_ch_enc):
+        for class_name, ctor in self._decoder_constructors(networks, num_ch_enc, decoder_dict):
             try:
                 decoder = ctor()
                 filtered, audit = self._match_state_dict(
