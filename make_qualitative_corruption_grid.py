@@ -840,12 +840,20 @@ def find_valid_weight_dirs(root: Path) -> list[Path]:
 
 
 def pick_best_candidate(candidates: list[Path], spec: ModelSpec) -> Optional[Path]:
+    best = pick_best_scored_candidate(candidates, spec)
+    return best[1] if best is not None else None
+
+
+def pick_best_scored_candidate(
+    candidates: list[Path],
+    spec: ModelSpec,
+) -> Optional[tuple[int, Path]]:
     scored = [(candidate_score(path, spec), path) for path in candidates]
     scored = [(score, path) for score, path in scored if score > 0]
     if not scored:
         return None
     scored.sort(key=lambda item: (item[0], -len(str(item[1]))), reverse=True)
-    return scored[0][1]
+    return scored[0]
 
 
 def safe_extract_zip(zip_path: Path, extract_dir: Path) -> None:
@@ -875,14 +883,14 @@ def resolve_backup_weights_folder(spec: ModelSpec, args: argparse.Namespace) -> 
     if backup_root is None or not backup_root.is_dir():
         return original
 
-    backup_dirs = find_valid_weight_dirs(backup_root)
-    best_dir = pick_best_candidate(backup_dirs, spec)
-    if best_dir is not None:
-        print(f"[INFO] {spec.name}: path not found, using backup folder {best_dir}")
-        return best_dir
-
+    best_dir = pick_best_scored_candidate(find_valid_weight_dirs(backup_root), spec)
     zip_candidates = [p for p in backup_root.glob("*.zip") if p.is_file()]
-    best_zip = pick_best_candidate(zip_candidates, spec)
+    best_zip = pick_best_scored_candidate(zip_candidates, spec)
+
+    if best_dir is not None and (best_zip is None or best_dir[0] >= best_zip[0]):
+        print(f"[INFO] {spec.name}: path not found, using backup folder {best_dir[1]}")
+        return best_dir[1]
+
     if best_zip is None:
         return original
 
@@ -891,11 +899,11 @@ def resolve_backup_weights_folder(spec: ModelSpec, args: argparse.Namespace) -> 
         if args.weights_extract_root
         else backup_root / "_extracted"
     )
-    extract_dir = extract_root / best_zip.stem
+    extract_dir = extract_root / best_zip[1].stem
     valid_inside = find_valid_weight_dirs(extract_dir)
     if not valid_inside:
-        print(f"[INFO] {spec.name}: extracting backup {best_zip} -> {extract_dir}")
-        safe_extract_zip(best_zip, extract_dir)
+        print(f"[INFO] {spec.name}: extracting backup {best_zip[1]} -> {extract_dir}")
+        safe_extract_zip(best_zip[1], extract_dir)
         valid_inside = find_valid_weight_dirs(extract_dir)
 
     best_inside = pick_best_candidate(valid_inside, spec) or (valid_inside[0] if valid_inside else None)
@@ -912,18 +920,24 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
     for spec in specs:
         if spec.kind == "monodepth2":
             spec.path = resolve_backup_weights_folder(spec, args)
-            predictors[spec.name] = Monodepth2Predictor(
-                name=spec.name,
-                weights_folder=spec.path,
-                code_root=code_root,
-                num_layers=args.num_layers,
-                height=args.height,
-                width=args.width,
-                min_depth=args.min_depth,
-                max_depth=args.max_depth,
-                device=args.device,
-                output_mode=args.model_output,
-            )
+            try:
+                predictors[spec.name] = Monodepth2Predictor(
+                    name=spec.name,
+                    weights_folder=spec.path,
+                    code_root=code_root,
+                    num_layers=args.num_layers,
+                    height=args.height,
+                    width=args.width,
+                    min_depth=args.min_depth,
+                    max_depth=args.max_depth,
+                    device=args.device,
+                    output_mode=args.model_output,
+                )
+            except Exception as exc:
+                if args.missing_policy == "error":
+                    raise
+                predictors[spec.name] = exc
+                print(f"[WARN] {spec.name}: could not initialize model, cells will be placeholders: {exc}")
         elif spec.kind == "predictions":
             predictors[spec.name] = None
         else:
@@ -1062,6 +1076,8 @@ def main() -> None:
             x = col_idx * (args.cell_width + gap)
             try:
                 if spec.kind == "monodepth2":
+                    if isinstance(predictors[spec.name], Exception):
+                        raise RuntimeError(str(predictors[spec.name]))
                     pred = predictors[spec.name].predict(rgb)
                     cell = prediction_to_image(
                         pred,
