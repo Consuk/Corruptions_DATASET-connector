@@ -89,6 +89,9 @@ class ModelSpec:
     name: str
     kind: str
     path: Path
+    code_root: Optional[Path] = None
+    checkpoint_files: Optional[list[str]] = None
+    pretrained_path: Optional[Path] = None
 
 
 def prepare_import_path(code_root: Optional[Path], purge_prefixes: Iterable[str]) -> None:
@@ -1403,9 +1406,12 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                 if parent.name == "EndoSfMLearner":
                     code_root = parent
                     break
+        spec.code_root = code_root
 
         if spec.kind in {"monodepth2", "monovit", "endodac", "manydepth", "endosfm"}:
             spec.path = resolve_backup_weights_folder(spec, args)
+            spec.pretrained_path = endodac_pretrained_map.get(model_key)
+            spec.checkpoint_files = model_checkpoint_files(spec)
             try:
                 if spec.kind == "monovit":
                     predictors[spec.name] = MonoViTPredictor(
@@ -1430,7 +1436,7 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                         max_depth=args.max_depth,
                         device=args.device,
                         output_mode=args.model_output,
-                        pretrained_path=endodac_pretrained_map.get(model_key),
+                        pretrained_path=spec.pretrained_path,
                     )
                 elif spec.kind == "manydepth":
                     predictors[spec.name] = ManyDepthPredictor(
@@ -1477,6 +1483,44 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
         else:
             raise ValueError(f"Unsupported model kind: {spec.kind}")
     return predictors
+
+
+def model_checkpoint_files(spec: ModelSpec) -> list[str]:
+    if spec.kind in {"monodepth2", "monovit", "manydepth"}:
+        return [
+            str(spec.path / "encoder.pth"),
+            str(spec.path / "depth.pth"),
+        ]
+    if spec.kind == "endodac":
+        files = [str(spec.path / "depth_model.pth")]
+        pretrained = spec.pretrained_path or spec.path
+        files.append(str(pretrained / "depth_anything_vitb14.pth"))
+        return files
+    if spec.kind == "endosfm":
+        try:
+            return [str(EndoSfmLearnerPredictor._find_dispnet_checkpoint(spec.path))]
+        except Exception:
+            return [
+                str(spec.path / "dispnet_model_best.pth.tar"),
+                str(spec.path / "dispnet_checkpoint.pth.tar"),
+            ]
+    return []
+
+
+def print_model_summary(specs: list[ModelSpec]) -> None:
+    print("\n======= MODEL SUMMARY =======")
+    for spec in specs:
+        print(f"- {spec.name}")
+        print(f"  kind: {spec.kind}")
+        print(f"  weights_path: {spec.path}")
+        if spec.code_root is not None:
+            print(f"  code_root: {spec.code_root}")
+        if spec.pretrained_path is not None:
+            print(f"  pretrained_path: {spec.pretrained_path}")
+        if spec.checkpoint_files:
+            print("  checkpoint_files:")
+            for path in spec.checkpoint_files:
+                print(f"    - {path}")
 
 
 def log_grid_to_wandb(
@@ -1545,6 +1589,7 @@ def main() -> None:
     )
 
     predictors = build_predictors(args, specs)
+    print_model_summary(specs)
 
     cell_size = (args.cell_width, args.cell_height)
     header_font = load_font(args.font_size, bold=True)
@@ -1578,7 +1623,17 @@ def main() -> None:
         "corruptions_root": str(corruptions_root),
         "severity": args.severity,
         "reference_rel": reference_rel,
-        "models": [{"name": spec.name, "kind": spec.kind, "path": str(spec.path)} for spec in specs],
+        "models": [
+            {
+                "name": spec.name,
+                "kind": spec.kind,
+                "path": str(spec.path),
+                "code_root": str(spec.code_root) if spec.code_root is not None else None,
+                "pretrained_path": str(spec.pretrained_path) if spec.pretrained_path is not None else None,
+                "checkpoint_files": spec.checkpoint_files or [],
+            }
+            for spec in specs
+        ],
         "rows": [],
     }
 
