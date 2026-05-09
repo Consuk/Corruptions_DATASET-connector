@@ -1609,7 +1609,7 @@ def main() -> None:
         for col_idx, spec in enumerate(specs, start=1):
             x = col_idx * (args.cell_width + gap)
             try:
-                if spec.kind == "monodepth2":
+                if spec.kind != "predictions":
                     if isinstance(predictors[spec.name], Exception):
                         raise RuntimeError(str(predictors[spec.name]))
                     pred = predictors[spec.name].predict(rgb)
