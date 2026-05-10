@@ -1327,6 +1327,15 @@ def frame_stems(token: str) -> list[str]:
     return out
 
 
+def split_side_image_dirs(side: Optional[str]) -> list[str]:
+    side = (side or "").lower()
+    if side in {"l", "left", "0", "image01"}:
+        return ["image01", "image02"]
+    if side in {"r", "right", "1", "image02"}:
+        return ["image02", "image01"]
+    return ["image01", "image02"]
+
+
 def resolve_explicit_rel(root: Path, rel_image: str) -> Optional[tuple[Path, str]]:
     rel = normalize_rel_path(rel_image)
     candidates = [root / rel]
@@ -1353,12 +1362,15 @@ def resolve_split_line(root: Path, line: str, exts: tuple[str, ...]) -> Optional
     if len(parts) >= 2:
         folder = first
         frame = parts[1]
+        image_dirs = split_side_image_dirs(parts[2] if len(parts) >= 3 else None)
         dirs = [
             folder,
             f"{folder}/data",
-            f"{folder}/image01",
-            f"{folder}/image02",
         ]
+        dirs.extend(f"{folder}/{image_dir}" for image_dir in image_dirs)
+        folder_name = Path(folder).name
+        if folder_name:
+            dirs.extend(f"{folder}/{folder_name}/{image_dir}" for image_dir in image_dirs)
         if folder.endswith("/data") or folder.endswith("/image01") or folder.endswith("/image02"):
             dirs.insert(0, folder)
         for directory in dirs:
