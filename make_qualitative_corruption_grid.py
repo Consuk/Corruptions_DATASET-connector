@@ -1389,6 +1389,7 @@ def resolve_split_line(root: Path, line: str, exts: tuple[str, ...]) -> Optional
         folder = first
         frame = parts[1]
         image_dirs = split_side_image_dirs(parts[2] if len(parts) >= 3 else None)
+        stems = frame_stems(frame)
         dirs = [
             folder,
             f"{folder}/data",
@@ -1404,7 +1405,7 @@ def resolve_split_line(root: Path, line: str, exts: tuple[str, ...]) -> Optional
         if folder.endswith("/data") or folder.endswith("/image01") or folder.endswith("/image02"):
             dirs.insert(0, folder)
         for directory in dirs:
-            for stem in frame_stems(frame):
+            for stem in stems:
                 if Path(frame).suffix.lower() in IMAGE_EXTENSIONS:
                     candidates.append(root / directory / frame)
                 for ext in exts:
@@ -1413,6 +1414,15 @@ def resolve_split_line(root: Path, line: str, exts: tuple[str, ...]) -> Optional
     for candidate in unique_paths(candidates):
         if candidate.is_file():
             return candidate, normalize_rel_path(str(candidate.relative_to(root)))
+
+    if len(parts) >= 2:
+        for directory in unique_paths([root / d for d in dirs]):
+            if not directory.is_dir():
+                continue
+            for stem in stems:
+                for candidate in sorted(directory.glob(f"{stem}*")):
+                    if candidate.is_file() and candidate.suffix.lower() in exts:
+                        return candidate, normalize_rel_path(str(candidate.relative_to(root)))
     return None
 
 
