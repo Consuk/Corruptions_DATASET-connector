@@ -1840,6 +1840,41 @@ def resolve_backup_weights_folder(spec: ModelSpec, args: argparse.Namespace) -> 
     return original
 
 
+def resolve_endodac_pretrained_folder(
+    name: str,
+    weights_folder: Path,
+    code_root: Optional[Path],
+    requested: Optional[Path],
+) -> Path:
+    filename = "depth_anything_vitb14.pth"
+    candidates: list[Path] = []
+
+    def add(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        path = path.expanduser()
+        if path.name == filename:
+            path = path.parent
+        candidates.append(path)
+        candidates.append(path / "pretrained_model")
+
+    add(requested)
+    add(weights_folder)
+    add(code_root / "pretrained_model" if code_root is not None else None)
+    add(Path("/workspace/ENDO-DAC/pretrained_model"))
+
+    for candidate in unique_paths(candidates):
+        if (candidate / filename).is_file():
+            if requested is not None and candidate != requested.expanduser():
+                print(f"[INFO] {name}: using ENDO-DAC pretrained backbone {candidate}")
+            return candidate
+
+    checked = [str(path / filename) for path in unique_paths(candidates)]
+    raise FileNotFoundError(
+        f"{name}: could not find {filename}. Checked: {checked}"
+    )
+
+
 def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
     predictors = {}
     global_code_root = Path(args.code_root).expanduser() if args.code_root else None
@@ -1878,7 +1913,16 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
 
         if spec.kind in {"monodepth2", "monovit", "endodac", "manydepth", "endosfm"}:
             spec.path = resolve_backup_weights_folder(spec, args)
-            spec.pretrained_path = endodac_pretrained_map.get(model_key)
+            requested_pretrained_path = endodac_pretrained_map.get(model_key)
+            if spec.kind == "endodac":
+                spec.pretrained_path = resolve_endodac_pretrained_folder(
+                    spec.name,
+                    spec.path,
+                    code_root,
+                    requested_pretrained_path,
+                )
+            else:
+                spec.pretrained_path = requested_pretrained_path
             spec.checkpoint_files = model_checkpoint_files(spec)
             try:
                 if spec.kind == "monovit":
