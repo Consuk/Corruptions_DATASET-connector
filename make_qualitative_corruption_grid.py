@@ -96,6 +96,7 @@ class ModelSpec:
     checkpoint_files: Optional[list[str]] = None
     pretrained_path: Optional[Path] = None
     load_audit: Optional[list[dict]] = None
+    input_size: Optional[tuple[int, int]] = None
 
 
 def prepare_import_path(code_root: Optional[Path], purge_prefixes: Iterable[str]) -> None:
@@ -1069,6 +1070,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_layers", type=int, default=18)
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=320)
+    parser.add_argument(
+        "--model_sizes",
+        nargs="*",
+        default=[],
+        metavar="NAME=HxW",
+        help=(
+            "Optional per-model inference size, e.g. EndoSfMLearner=288x512 "
+            "ENDO-DAC=224x280. Values are height x width."
+        ),
+    )
     parser.add_argument("--min_depth", type=float, default=1e-3)
     parser.add_argument("--max_depth", type=float, default=80.0)
     parser.add_argument("--device", default="cuda")
@@ -1186,6 +1197,21 @@ def parse_name_map(values: Iterable[str]) -> dict[str, str]:
             raise ValueError(f"Expected NAME=VALUE, got: {item}")
         mapping[name] = value
     return mapping
+
+
+def parse_model_sizes(values: Iterable[str]) -> dict[str, tuple[int, int]]:
+    sizes = {}
+    for key, value in parse_name_map(values).items():
+        match = re.fullmatch(r"\s*(\d+)\s*[xX,:]\s*(\d+)\s*", value)
+        if not match:
+            raise ValueError(
+                f"Expected model size as NAME=HxW, for example MonoDepth2=256x320; got {value!r}"
+            )
+        height, width = int(match.group(1)), int(match.group(2))
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Model size must be positive, got {value!r}")
+        sizes[key] = (height, width)
+    return sizes
 
 
 def infer_model_kind(spec: ModelSpec, explicit_types: dict[str, str]) -> str:
@@ -1340,7 +1366,7 @@ def resolve_explicit_rel(root: Path, rel_image: str) -> Optional[tuple[Path, str
     rel = normalize_rel_path(rel_image)
     candidates = [root / rel]
     parts = rel.split("/")
-    if len(parts) > 1 and parts[0] == "endovis_data":
+    if len(parts) > 1 and parts[0] in {"endovis_data", "test"}:
         candidates.append(root / "/".join(parts[1:]))
     for candidate in unique_paths(candidates):
         if candidate.is_file():
@@ -1367,6 +1393,10 @@ def resolve_split_line(root: Path, line: str, exts: tuple[str, ...]) -> Optional
             folder,
             f"{folder}/data",
         ]
+        if folder.startswith("test/"):
+            dirs.append(folder[len("test/") :])
+        else:
+            dirs.append(f"test/{folder}")
         dirs.extend(f"{folder}/{image_dir}" for image_dir in image_dirs)
         folder_name = Path(folder).name
         if folder_name:
@@ -1811,9 +1841,12 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
         key: Path(value).expanduser()
         for key, value in parse_name_map(args.endodac_pretrained_paths).items()
     }
+    model_size_map = parse_model_sizes(args.model_sizes)
 
     for spec in specs:
         model_key = normalize_match_text(spec.name)
+        height, width = model_size_map.get(model_key, (args.height, args.width))
+        spec.input_size = (height, width)
         code_root = code_root_map.get(model_key, global_code_root)
         if code_root is None and spec.kind == "endodac":
             for parent in [spec.path, *spec.path.parents]:
@@ -1843,8 +1876,8 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                         name=spec.name,
                         weights_folder=spec.path,
                         code_root=code_root,
-                        height=args.height,
-                        width=args.width,
+                        height=height,
+                        width=width,
                         min_depth=args.min_depth,
                         max_depth=args.max_depth,
                         device=args.device,
@@ -1855,8 +1888,8 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                         name=spec.name,
                         weights_folder=spec.path,
                         code_root=code_root,
-                        height=args.height,
-                        width=args.width,
+                        height=height,
+                        width=width,
                         min_depth=args.min_depth,
                         max_depth=args.max_depth,
                         device=args.device,
@@ -1868,8 +1901,8 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                         name=spec.name,
                         weights_folder=spec.path,
                         code_root=code_root,
-                        height=args.height,
-                        width=args.width,
+                        height=height,
+                        width=width,
                         min_depth=args.min_depth,
                         max_depth=args.max_depth,
                         device=args.device,
@@ -1881,8 +1914,8 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                         name=spec.name,
                         weights_folder=spec.path,
                         code_root=code_root,
-                        height=args.height,
-                        width=args.width,
+                        height=height,
+                        width=width,
                         device=args.device,
                     )
                 else:
@@ -1891,8 +1924,8 @@ def build_predictors(args: argparse.Namespace, specs: list[ModelSpec]):
                         weights_folder=spec.path,
                         code_root=code_root,
                         num_layers=args.num_layers,
-                        height=args.height,
-                        width=args.width,
+                        height=height,
+                        width=width,
                         min_depth=args.min_depth,
                         max_depth=args.max_depth,
                         device=args.device,
@@ -1941,6 +1974,8 @@ def print_model_summary(specs: list[ModelSpec]) -> None:
         print(f"- {spec.name}")
         print(f"  kind: {spec.kind}")
         print(f"  weights_path: {spec.path}")
+        if spec.input_size is not None:
+            print(f"  input_size: {spec.input_size[0]}x{spec.input_size[1]}")
         if spec.code_root is not None:
             print(f"  code_root: {spec.code_root}")
         if spec.pretrained_path is not None:
@@ -2130,6 +2165,7 @@ def main() -> None:
                 "name": spec.name,
                 "kind": spec.kind,
                 "path": str(spec.path),
+                "input_size": list(spec.input_size) if spec.input_size is not None else None,
                 "code_root": str(spec.code_root) if spec.code_root is not None else None,
                 "pretrained_path": str(spec.pretrained_path) if spec.pretrained_path is not None else None,
                 "checkpoint_files": spec.checkpoint_files or [],
