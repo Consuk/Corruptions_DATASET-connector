@@ -148,6 +148,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gap", type=int, default=5)
     parser.add_argument("--figure_margin", type=int, default=44)
     parser.add_argument("--label_font_size", type=int, default=18)
+    parser.add_argument("--no_labels", action="store_true")
     parser.add_argument("--caption_font_size", type=int, default=16)
     parser.add_argument("--caption", default="")
     parser.add_argument("--save_metadata", action="store_true")
@@ -242,7 +243,8 @@ def main() -> None:
             exts=exts,
         )
         tile = resize_cover(Image.open(image_path), (args.tile_width, args.tile_height))
-        tile = draw_center_label(tile, display_label(corruption), label_font)
+        if not args.no_labels:
+            tile = draw_center_label(tile, display_label(corruption), label_font)
         row = index // cols
         col = index % cols
         x = grid_x + col * (args.tile_width + args.gap)
