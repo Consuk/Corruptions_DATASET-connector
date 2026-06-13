@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import shlex
 import subprocess
 import sys
@@ -119,12 +120,12 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
             output_style="output_dir",
         ),
         "af_sfmlearner": ModelEvalConfig(
-            repo_root=p("/workspace/AF-SfMLearner"),
+            repo_root=p("/workspace/repos/AF-SfMLearner"),
             script="eval_endovis_corruptions.py",
             weights=p("/workspace/hamlyn_weights/afsfmlearner_hamlyn_weights_19"),
             default_args=(
                 "--splits_dir",
-                "/workspace/AF-SfMLearner/splits",
+                "/workspace/repos/AF-SfMLearner/splits",
                 "--split",
                 "hamlyn",
                 "--dataset",
@@ -256,7 +257,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
             output_style="output_dir",
         ),
         "af_sfmlearner": ModelEvalConfig(
-            repo_root=p("/workspace/AF-SfMLearner"),
+            repo_root=p("/workspace/repos/AF-SfMLearner"),
             script="eval_endovis_corruptions.py",
             weights=p("/workspace/c3vd_weights/afsfmlearner_c3vd_weights_19"),
             default_args=(
@@ -397,11 +398,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hamlyn-ablated-corruptions-root",
-        default="/workspace/datasets/hamlyn/hamlyn_corruptions_test24",
+        default="/workspace/datasets/hamlyn/hamlyn_corruptions_test24_globalK",
         help=(
             "Root used for the global-K Hamlyn condition. If the same images are used, "
             "pass the repo-specific global-K override via --hamlyn-ablated-extra-args."
         ),
+    )
+    parser.add_argument(
+        "--prepare-hamlyn-global-k-corruptions",
+        action="store_true",
+        help=(
+            "Create --hamlyn-ablated-corruptions-root by linking/copying the aware "
+            "Hamlyn corruptions and replacing every intrinsics.txt with one global K_0."
+        ),
+    )
+    parser.add_argument(
+        "--hamlyn-global-k-source",
+        default=None,
+        help=(
+            "intrinsics.txt used as K_0 for Hamlyn ablation. If omitted, the first "
+            "intrinsics.txt found under --hamlyn-aware-corruptions-root is used."
+        ),
+    )
+    parser.add_argument(
+        "--hamlyn-global-k-file-mode",
+        choices=("symlink", "copy"),
+        default="symlink",
+        help="How to mirror non-intrinsics files when preparing Hamlyn global-K corruptions.",
     )
     parser.add_argument(
         "--c3vd-aware-corruptions-root",
@@ -411,6 +434,24 @@ def parse_args() -> argparse.Namespace:
         "--c3vd-ablated-corruptions-root",
         default="/workspace/datasets/c3vd_corrupted_raw",
         help="Corruptions generated from raw omnidirectional C3VD frames.",
+    )
+    parser.add_argument(
+        "--c3vd-raw-data-root",
+        default="/workspace/datasets/c3vd_consuk",
+        help="Original non-preprocessed C3VD root used to generate raw ablated corruptions.",
+    )
+    parser.add_argument(
+        "--c3vd-split-file",
+        default="/workspace/Monodepth2/splits/c3vd/test_files.txt",
+        help="C3VD test split used when generating raw ablated corruptions.",
+    )
+    parser.add_argument(
+        "--prepare-c3vd-raw-corruptions",
+        action="store_true",
+        help=(
+            "Generate --c3vd-ablated-corruptions-root from --c3vd-raw-data-root "
+            "before evaluation, using generate_corruptions_from_testlist.py."
+        ),
     )
     parser.add_argument("--hamlyn-aware-extra-args", default="")
     parser.add_argument(
@@ -494,7 +535,17 @@ def build_plan(args: argparse.Namespace) -> list[RunPlan]:
             root = condition_corruptions_root(args, dataset, condition)
             extra_args = condition_extra_args(args, dataset, condition)
             if condition == "ablated" and not extra_args and not args.allow_empty_ablation_overrides:
-                if dataset == "hamlyn" or (
+                ablated_root_differs = root != condition_corruptions_root(args, dataset, "aware")
+                if dataset == "hamlyn" and not (
+                    args.prepare_hamlyn_global_k_corruptions or ablated_root_differs
+                ):
+                    raise RuntimeError(
+                        "hamlyn ablated condition has no explicit geometry override and uses the "
+                        "same root as the aware condition. Pass --hamlyn-ablated-extra-args, "
+                        "--prepare-hamlyn-global-k-corruptions, or a distinct "
+                        "--hamlyn-ablated-corruptions-root."
+                    )
+                if dataset == "c3vd" and (
                     dataset == "c3vd"
                     and root == condition_corruptions_root(args, "c3vd", "aware")
                 ):
@@ -521,7 +572,11 @@ def build_plan(args: argparse.Namespace) -> list[RunPlan]:
                     *output_flags,
                 ]
                 warnings = []
-                if condition == "ablated" and not extra_args:
+                if (
+                    condition == "ablated"
+                    and not extra_args
+                    and root == condition_corruptions_root(args, dataset, "aware")
+                ):
                     warnings.append("No condition-specific extra args were supplied.")
                 plans.append(
                     RunPlan(
@@ -609,6 +664,139 @@ def run_plan(plan: RunPlan, args: argparse.Namespace) -> None:
             f"Expected metrics CSV was not produced for {plan.dataset}/{plan.condition}/{plan.model}: "
             f"{plan.output_csv}"
         )
+
+
+def first_file_under(root: Path, name: str) -> Path:
+    for current_root, _, files in os.walk(root):
+        if name in files:
+            return Path(current_root) / name
+    raise FileNotFoundError(f"Could not find {name} under {root}")
+
+
+def link_or_copy_file(src: Path, dst: Path, mode: str) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists() or dst.is_symlink():
+        return
+    if mode == "symlink":
+        try:
+            os.symlink(src, dst)
+            return
+        except OSError:
+            pass
+    shutil.copy2(src, dst)
+
+
+def prepare_hamlyn_global_k_corruptions(args: argparse.Namespace) -> None:
+    aware_root = Path(args.hamlyn_aware_corruptions_root).expanduser()
+    output_root = Path(args.hamlyn_ablated_corruptions_root).expanduser()
+    if output_root.is_dir() and any(output_root.iterdir()):
+        print(f"[INFO] Hamlyn global-K ablated corruptions already exist: {output_root}")
+        return
+    if not aware_root.is_dir():
+        raise FileNotFoundError(f"Hamlyn aware corruptions root not found: {aware_root}")
+
+    if args.hamlyn_global_k_source:
+        k0_path = Path(args.hamlyn_global_k_source).expanduser()
+    else:
+        k0_path = first_file_under(aware_root, "intrinsics.txt")
+    if not k0_path.is_file():
+        raise FileNotFoundError(f"Hamlyn global K_0 source not found: {k0_path}")
+    k0_text = k0_path.read_text(encoding="utf-8")
+
+    log_dir = Path(args.output_dir).expanduser().resolve() / "intermediate" / "hamlyn" / "prepare_global_k"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = log_dir / "manifest.json"
+    manifest = {
+        "aware_root": str(aware_root),
+        "output_root": str(output_root),
+        "global_k_source": str(k0_path),
+        "file_mode": args.hamlyn_global_k_file_mode,
+        "replaced_intrinsics_files": 0,
+        "linked_or_copied_files": 0,
+    }
+
+    print(f"[RUN] preparing Hamlyn global-K ablated corruptions -> {output_root}")
+    print(f"[INFO] Hamlyn K_0 source: {k0_path}")
+    for current_root, dirs, files in os.walk(aware_root):
+        dirs.sort()
+        files.sort()
+        current = Path(current_root)
+        rel_dir = current.relative_to(aware_root)
+        out_dir = output_root / rel_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for filename in files:
+            src = current / filename
+            dst = out_dir / filename
+            if filename == "intrinsics.txt":
+                if not dst.exists():
+                    dst.write_text(k0_text, encoding="utf-8")
+                manifest["replaced_intrinsics_files"] += 1
+            else:
+                link_or_copy_file(src, dst, args.hamlyn_global_k_file_mode)
+                manifest["linked_or_copied_files"] += 1
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"[INFO] Hamlyn global-K manifest: {manifest_path}")
+
+
+def prepare_c3vd_raw_corruptions(args: argparse.Namespace) -> None:
+    output_root = Path(args.c3vd_ablated_corruptions_root).expanduser()
+    if output_root.is_dir() and any(output_root.iterdir()):
+        print(f"[INFO] C3VD raw ablated corruptions already exist: {output_root}")
+        return
+
+    script = Path(__file__).resolve().parents[1] / "generate_corruptions_from_testlist.py"
+    corruptions_arg = (
+        "all"
+        if selected_corruptions(args.corruptions) is None
+        else ",".join(args.corruptions)
+    )
+    severities_arg = ",".join(str(sev) for sev in args.severities)
+    command = [
+        args.python,
+        str(script),
+        "--test_list",
+        str(Path(args.c3vd_split_file).expanduser()),
+        "--input_root",
+        str(Path(args.c3vd_raw_data_root).expanduser()),
+        "--output_root",
+        str(output_root),
+        "--split_name",
+        "test",
+        "--corruptions",
+        corruptions_arg,
+        "--severities",
+        severities_arg,
+    ]
+
+    log_dir = Path(args.output_dir).expanduser().resolve() / "intermediate" / "c3vd" / "prepare_raw"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "generate_corruptions_from_testlist.log"
+    manifest_path = log_dir / "command.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "raw_data_root": str(Path(args.c3vd_raw_data_root).expanduser()),
+                "output_root": str(output_root),
+                "command": command,
+            },
+            f,
+            indent=2,
+        )
+
+    print(f"[RUN] preparing C3VD raw ablated corruptions -> {output_root}")
+    with open(log_path, "w", encoding="utf-8") as log:
+        log.write(" ".join(shlex.quote(part) for part in command) + "\n\n")
+        proc = subprocess.run(
+            command,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    if proc.returncode != 0:
+        raise RuntimeError(f"Failed to generate C3VD raw corruptions. See log: {log_path}")
 
 
 def header_map(headers: Iterable[str]) -> dict[str, str]:
@@ -853,7 +1041,28 @@ def main() -> None:
     plans = build_plan(args)
     if args.dry_run:
         print_dry_run(args, plans)
+        if args.prepare_hamlyn_global_k_corruptions:
+            print("\nHamlyn global-K corruption preparation would run before evaluation:")
+            print(f"  aware_root: {Path(args.hamlyn_aware_corruptions_root).expanduser()}")
+            print(f"  output_root: {Path(args.hamlyn_ablated_corruptions_root).expanduser()}")
+            print(
+                "  global_k_source: "
+                + str(Path(args.hamlyn_global_k_source).expanduser())
+                if args.hamlyn_global_k_source
+                else "  global_k_source: first intrinsics.txt found under aware_root"
+            )
+        if args.prepare_c3vd_raw_corruptions:
+            print("\nC3VD raw corruption preparation would run before evaluation:")
+            print(f"  raw_data_root: {Path(args.c3vd_raw_data_root).expanduser()}")
+            print(f"  output_root: {Path(args.c3vd_ablated_corruptions_root).expanduser()}")
+            print(f"  split_file: {Path(args.c3vd_split_file).expanduser()}")
         return
+
+    if args.prepare_hamlyn_global_k_corruptions and "hamlyn" in selected_datasets(args.dataset):
+        prepare_hamlyn_global_k_corruptions(args)
+
+    if args.prepare_c3vd_raw_corruptions and "c3vd" in selected_datasets(args.dataset):
+        prepare_c3vd_raw_corruptions(args)
 
     if not args.collect_only:
         for plan in plans:
