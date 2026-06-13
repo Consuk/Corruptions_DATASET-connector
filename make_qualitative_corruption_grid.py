@@ -11,7 +11,7 @@ import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -995,8 +995,8 @@ class EndoSfmLearnerPredictor(Monodepth2Predictor):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a qualitative corruption grid: Input column plus one column per "
-            "model/prediction source."
+            "Build a qualitative corruption grid: Input column, optional GT depth "
+            "column, plus one column per model/prediction source."
         )
     )
     parser.add_argument("--corruptions_root", required=True)
@@ -1031,6 +1031,38 @@ def parse_args() -> argparse.Namespace:
             "Precomputed prediction roots. Files are matched by corruption, severity "
             "and relative image path; accepts npy/npz/png/jpg/tif."
         ),
+    )
+    parser.add_argument(
+        "--gt_depths_file",
+        default=None,
+        help=(
+            "Optional npz/npy file with GT depth maps aligned with --split_file. "
+            "When set, a GT depth column is inserted after the input column."
+        ),
+    )
+    parser.add_argument(
+        "--gt_depths_key",
+        default="data",
+        help="NPZ key for --gt_depths_file. Falls back to the first key if missing.",
+    )
+    parser.add_argument(
+        "--gt_depth_index",
+        type=int,
+        default=None,
+        help="Optional GT index override. Defaults to --split_index.",
+    )
+    parser.add_argument(
+        "--gt_root",
+        default=None,
+        help=(
+            "Optional root containing per-frame GT depth files. Files are matched "
+            "from the selected relative image path and split line."
+        ),
+    )
+    parser.add_argument(
+        "--gt_label",
+        default="GT Depth",
+        help="Header label for the GT depth column.",
     )
     parser.add_argument(
         "--models_json",
@@ -1136,10 +1168,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--cell_width", type=int, default=180)
     parser.add_argument("--cell_height", type=int, default=88)
-    parser.add_argument("--header_height", type=int, default=26)
+    parser.add_argument("--header_height", type=int, default=34)
     parser.add_argument("--gap", type=int, default=4)
-    parser.add_argument("--font_size", type=int, default=14)
-    parser.add_argument("--label_font_size", type=int, default=13)
+    parser.add_argument("--font_size", type=int, default=18)
+    parser.add_argument("--label_font_size", type=int, default=17)
     parser.add_argument("--cmap", default="magma")
     parser.add_argument("--normalize_low", type=float, default=2.0)
     parser.add_argument("--normalize_high", type=float, default=98.0)
@@ -1147,6 +1179,11 @@ def parse_args() -> argparse.Namespace:
         "--invert_prediction_files",
         action="store_true",
         help="Invert loaded prediction files before colorizing, useful for depth maps.",
+    )
+    parser.add_argument(
+        "--invert_gt_depth",
+        action="store_true",
+        help="Invert GT depth before colorizing so it visually matches disparity maps.",
     )
     parser.add_argument(
         "--missing_policy",
@@ -1469,6 +1506,34 @@ def pick_reference_image(
     raise FileNotFoundError(f"No image found under {root}")
 
 
+def find_split_index_for_rel_image(
+    root: Path,
+    rel_path: str,
+    split_lines: list[str],
+    exts: tuple[str, ...],
+) -> Optional[int]:
+    target_rel = normalize_rel_path(rel_path)
+    target_stem = Path(target_rel).stem
+    for idx, line in enumerate(split_lines):
+        try:
+            _, resolved_rel = resolve_split_line(root, line, exts) or (None, None)
+        except Exception:
+            resolved_rel = None
+        if resolved_rel and normalize_rel_path(resolved_rel) == target_rel:
+            return idx
+
+        parts = line.split()
+        if len(parts) >= 2:
+            folder = normalize_rel_path(parts[0])
+            stems = frame_stems(parts[1])
+            if target_stem in stems and (
+                target_rel.startswith(folder.rstrip("/") + "/")
+                or target_rel.startswith(f"test/{folder.rstrip('/')}/")
+            ):
+                return idx
+    return None
+
+
 def resolve_row_image(
     data_root: Path,
     rel_path: str,
@@ -1499,6 +1564,25 @@ def load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
         except OSError:
             continue
     return ImageFont.load_default()
+
+
+def fit_font_to_box(
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    max_height: int,
+    bold: bool = False,
+    min_size: int = 9,
+) -> ImageFont.ImageFont:
+    start_size = int(getattr(font, "size", 14))
+    probe = Image.new("RGB", (10, 10))
+    draw = ImageDraw.Draw(probe)
+    for size in range(start_size, min_size - 1, -1):
+        candidate = load_font(size, bold=bold)
+        bbox = draw.textbbox((0, 0), text, font=candidate, stroke_width=1)
+        if bbox[2] - bbox[0] <= max_width and bbox[3] - bbox[1] <= max_height:
+            return candidate
+    return load_font(min_size, bold=bold)
 
 
 def resize_to_cell(img: Image.Image, cell_size: tuple[int, int]) -> Image.Image:
@@ -1597,6 +1681,202 @@ def load_prediction_file(path: Path) -> np.ndarray | Image.Image:
     return arr.astype(np.float32)
 
 
+def read_split_lines(split_file: Optional[str]) -> list[str]:
+    if not split_file:
+        return []
+    with open(split_file, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+
+def load_gt_depths_file(path: Path, key: str) -> Any:
+    suffix = path.suffix.lower()
+    if suffix == ".npz":
+        data = np.load(path, allow_pickle=True)
+        selected_key = key if key in data.files else data.files[0]
+        return data[selected_key]
+    if suffix == ".npy":
+        return np.load(path, allow_pickle=True)
+    raise ValueError(f"--gt_depths_file must be .npz or .npy, got: {path}")
+
+
+def gt_depths_length(depths: Any) -> Optional[int]:
+    if isinstance(depths, np.ndarray) and depths.ndim <= 2:
+        return 1
+    try:
+        return len(depths)
+    except TypeError:
+        return None
+
+
+def gt_depth_from_stack(depths: Any, index: int) -> np.ndarray:
+    if isinstance(depths, np.ndarray) and depths.ndim <= 2:
+        if index not in (0, -1):
+            raise IndexError(
+                f"GT file contains a single depth map, but index {index} was requested"
+            )
+        return np.squeeze(depths).astype(np.float32)
+
+    length = gt_depths_length(depths)
+    if length is not None and (index < 0 or index >= length):
+        raise IndexError(f"GT index {index} outside GT depth count {length}")
+
+    return np.squeeze(np.asarray(depths[index])).astype(np.float32)
+
+
+def stem_variants(stem: str) -> list[str]:
+    variants = [stem]
+    lower = stem.lower()
+    for suffix in ("_color", "_rgb", "_image", "_left", "_right"):
+        if lower.endswith(suffix):
+            variants.append(stem[: -len(suffix)])
+
+    out = []
+    for variant in variants:
+        if variant and variant not in out:
+            out.append(variant)
+    return out
+
+
+def depth_name_variants(stem: str) -> list[str]:
+    names = []
+    for base in stem_variants(stem):
+        names.extend(
+            [
+                base,
+                f"{base}_depth",
+                f"{base}_gt",
+                f"{base}_gt_depth",
+                f"{base}_depth_map",
+                f"{base}_disp",
+                f"{base}_disparity",
+            ]
+        )
+
+    out = []
+    for name in names:
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def depth_rel_variants(rel_path: str) -> list[str]:
+    rel = normalize_rel_path(rel_path)
+    parts = rel.split("/") if rel else []
+    variants = [rel]
+
+    if len(parts) > 1 and parts[0] in {"endovis_data", "test"}:
+        variants.append("/".join(parts[1:]))
+
+    replacements = {
+        "image01": ("depth01", "disp01", "gt01"),
+        "image02": ("depth02", "disp02", "gt02"),
+        "image_01": ("depth_01", "disp_01", "gt_01"),
+        "image_02": ("depth_02", "disp_02", "gt_02"),
+        "images": ("depth", "depths", "gt"),
+        "image": ("depth", "depths", "gt"),
+        "rgb": ("depth", "depths", "gt"),
+        "color": ("depth", "depths", "gt"),
+    }
+
+    for idx, part in enumerate(parts):
+        for replacement in replacements.get(part.lower(), ()):
+            changed = parts.copy()
+            changed[idx] = replacement
+            variants.append("/".join(changed))
+
+    out = []
+    for variant in variants:
+        variant = variant.strip("/")
+        if variant and variant not in out:
+            out.append(variant)
+    return out
+
+
+def add_depth_file_variants(candidates: list[Path], base: Path) -> None:
+    candidates.append(base)
+    for ext in DEPTH_EXTENSIONS:
+        candidates.append(base.with_suffix(ext))
+
+    for name in depth_name_variants(base.stem):
+        named = base.with_name(name)
+        for ext in DEPTH_EXTENSIONS:
+            candidates.append(named.with_suffix(ext))
+
+
+def split_line_gt_rel_candidates(line: str) -> list[str]:
+    parts = line.strip().split()
+    if not parts:
+        return []
+
+    first = normalize_rel_path(parts[0])
+    candidates = [first]
+
+    if len(parts) >= 2:
+        folder = first
+        frame = parts[1]
+        image_dirs = split_side_image_dirs(parts[2] if len(parts) >= 3 else None)
+        stems = frame_stems(frame)
+        base_dirs = [
+            folder,
+            f"{folder}/data",
+        ]
+        if folder.startswith("test/"):
+            base_dirs.append(folder[len("test/") :])
+        else:
+            base_dirs.append(f"test/{folder}")
+        base_dirs.extend(f"{folder}/{image_dir}" for image_dir in image_dirs)
+        folder_name = Path(folder).name
+        if folder_name:
+            base_dirs.extend(f"{folder}/{folder_name}/{image_dir}" for image_dir in image_dirs)
+
+        flat_dirs: list[str] = []
+        for directory in base_dirs:
+            for variant in depth_rel_variants(directory):
+                if variant not in flat_dirs:
+                    flat_dirs.append(variant)
+
+        for directory in flat_dirs:
+            for stem in stems:
+                for name in depth_name_variants(Path(stem).stem):
+                    for ext in DEPTH_EXTENSIONS:
+                        candidates.append(f"{directory}/{name}{ext}")
+
+    out = []
+    for candidate in candidates:
+        candidate = normalize_rel_path(candidate).strip("/")
+        if candidate and candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def gt_depth_candidates(
+    gt_root: Path,
+    rel_path: str,
+    split_line: Optional[str] = None,
+) -> list[Path]:
+    candidates: list[Path] = []
+
+    for rel_variant in depth_rel_variants(rel_path):
+        add_depth_file_variants(candidates, gt_root / rel_variant)
+
+    if split_line:
+        for rel_candidate in split_line_gt_rel_candidates(split_line):
+            add_depth_file_variants(candidates, gt_root / rel_candidate)
+
+    return unique_paths(candidates)
+
+
+def find_gt_depth_file(
+    gt_root: Path,
+    rel_path: str,
+    split_line: Optional[str] = None,
+) -> Optional[Path]:
+    for path in gt_depth_candidates(gt_root, rel_path, split_line):
+        if path.is_file():
+            return path
+    return None
+
+
 def prediction_candidates(
     pred_root: Path,
     corruption: str,
@@ -1671,22 +1951,64 @@ def draw_header(
     fill: tuple[int, int, int],
 ) -> None:
     draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle((x, y, x + width, y + height), radius=3, fill=fill)
-    bbox = draw.textbbox((0, 0), label, font=font)
+    draw.rounded_rectangle((x, y, x + width - 1, y + height - 1), radius=4, fill=fill)
+    fitted_font = fit_font_to_box(
+        label,
+        font,
+        max_width=width - 12,
+        max_height=height - 6,
+        bold=True,
+    )
+    bbox = draw.textbbox((0, 0), label, font=fitted_font, stroke_width=1)
     tx = x + (width - (bbox[2] - bbox[0])) // 2
     ty = y + (height - (bbox[3] - bbox[1])) // 2 - 1
-    draw.text((tx, ty), label, fill=(255, 255, 255), font=font)
+    draw.text(
+        (tx, ty),
+        label,
+        fill=(255, 255, 255),
+        font=fitted_font,
+        stroke_width=1,
+        stroke_fill=(20, 20, 20),
+    )
 
 
 def draw_row_label(cell: Image.Image, label: str, font: ImageFont.ImageFont) -> Image.Image:
     cell = cell.copy()
     draw = ImageDraw.Draw(cell, "RGBA")
-    bbox = draw.textbbox((0, 0), label, font=font)
-    pad_x = 6
-    pad_y = 3
-    rect = (0, 0, bbox[2] - bbox[0] + pad_x * 2, bbox[3] - bbox[1] + pad_y * 2)
-    draw.rectangle(rect, fill=(67, 92, 204, 205))
-    draw.text((pad_x, pad_y - 1), label, fill=(255, 255, 255, 255), font=font)
+    pad_x = 8
+    pad_y = 5
+    margin = 5
+    fitted_font = fit_font_to_box(
+        label,
+        font,
+        max_width=cell.width - 2 * (margin + pad_x),
+        max_height=max(10, cell.height // 3),
+        bold=True,
+    )
+    bbox = draw.textbbox((0, 0), label, font=fitted_font, stroke_width=1)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    rect = (
+        margin,
+        margin,
+        min(cell.width - margin, margin + text_w + pad_x * 2),
+        min(cell.height - margin, margin + text_h + pad_y * 2),
+    )
+    draw.rounded_rectangle(
+        rect,
+        radius=4,
+        fill=(18, 22, 30, 225),
+        outline=(255, 255, 255, 185),
+        width=1,
+    )
+    draw.text(
+        (margin + pad_x, margin + pad_y - 1),
+        label,
+        fill=(255, 255, 255, 255),
+        font=fitted_font,
+        stroke_width=1,
+        stroke_fill=(0, 0, 0, 255),
+    )
     return cell.convert("RGB")
 
 
@@ -2174,6 +2496,42 @@ def main() -> None:
         split_index=args.split_index,
         exts=exts,
     )
+    split_lines = read_split_lines(args.split_file)
+    gt_index = args.gt_depth_index if args.gt_depth_index is not None else args.split_index
+    if args.gt_depth_index is None and args.rel_image and split_lines:
+        matched_index = find_split_index_for_rel_image(
+            first_data_root,
+            reference_rel,
+            split_lines,
+            exts,
+        )
+        if matched_index is not None:
+            gt_index = matched_index
+            print(f"[INFO] GT index resolved from --rel_image: {gt_index}")
+        else:
+            print(
+                "[WARN] Could not match --rel_image to --split_file; "
+                f"using GT index {gt_index}."
+            )
+    gt_depths = None
+    if args.gt_depths_file:
+        gt_path = Path(args.gt_depths_file).expanduser()
+        if not gt_path.is_file():
+            raise FileNotFoundError(f"GT depths file not found: {gt_path}")
+        gt_depths = load_gt_depths_file(gt_path, args.gt_depths_key)
+        gt_count = gt_depths_length(gt_depths)
+        if split_lines and gt_count is not None and gt_count != len(split_lines):
+            print(
+                "[WARN] GT depth count ({gt_count}) != split lines ({split_count}); "
+                "GT is selected by index.".format(
+                    gt_count=gt_count,
+                    split_count=len(split_lines),
+                )
+            )
+    gt_root = Path(args.gt_root).expanduser() if args.gt_root else None
+    if gt_root is not None and not gt_root.is_dir():
+        raise FileNotFoundError(f"GT root not found: {gt_root}")
+    include_gt = gt_depths is not None or gt_root is not None
 
     predictors = build_predictors(args, specs)
     print_model_summary(specs)
@@ -2187,7 +2545,7 @@ def main() -> None:
     label_font = load_font(args.label_font_size, bold=True)
     small_font = load_font(max(10, args.label_font_size - 1), bold=False)
 
-    columns = ["Input"] + [spec.name for spec in specs]
+    columns = ["Input"] + ([args.gt_label] if include_gt else []) + [spec.name for spec in specs]
     n_cols = len(columns)
     n_rows = len(corruptions)
     gap = args.gap
@@ -2207,13 +2565,27 @@ def main() -> None:
     header_y = 0
     for col_idx, label in enumerate(columns):
         x = col_idx * (args.cell_width + gap)
-        color = (88, 113, 232) if col_idx == 0 else (231, 91, 69)
+        if col_idx == 0:
+            color = (35, 72, 145)
+        elif include_gt and col_idx == 1:
+            color = (30, 118, 91)
+        else:
+            color = (153, 54, 45)
         draw_header(canvas, x, header_y, args.cell_width, args.header_height, label, header_font, color)
 
     metadata = {
         "corruptions_root": str(corruptions_root),
         "severity": args.severity,
         "reference_rel": reference_rel,
+        "gt": {
+            "enabled": include_gt,
+            "depths_file": str(Path(args.gt_depths_file).expanduser()) if args.gt_depths_file else None,
+            "depths_key": args.gt_depths_key if args.gt_depths_file else None,
+            "depth_index": gt_index if args.gt_depths_file else None,
+            "root": str(gt_root) if gt_root is not None else None,
+            "label": args.gt_label,
+            "invert": args.invert_gt_depth,
+        },
         "models": [
             {
                 "name": spec.name,
@@ -2251,10 +2623,64 @@ def main() -> None:
             "corruption": corruption,
             "image_path": str(image_path),
             "relative_path": row_rel,
+            "gt": None,
             "cells": [],
         }
 
-        for col_idx, spec in enumerate(specs, start=1):
+        model_col_start = 1
+        if include_gt:
+            gt_x = args.cell_width + gap
+            try:
+                if gt_depths is not None:
+                    gt_values = gt_depth_from_stack(gt_depths, gt_index)
+                    gt_stats = prediction_stats(gt_values)
+                    gt_cell = prediction_to_image(
+                        gt_values,
+                        cell_size=cell_size,
+                        cmap=args.cmap,
+                        low=args.normalize_low,
+                        high=args.normalize_high,
+                        invert=args.invert_gt_depth,
+                    )
+                    row_meta["gt"] = {
+                        "source": str(Path(args.gt_depths_file).expanduser()),
+                        "index": gt_index,
+                        "prediction_stats": gt_stats,
+                    }
+                else:
+                    split_line = split_lines[gt_index] if 0 <= gt_index < len(split_lines) else None
+                    gt_path = find_gt_depth_file(gt_root, row_rel, split_line)
+                    if gt_path is None:
+                        raise FileNotFoundError(
+                            f"No GT depth found for {row_rel} in {gt_root}"
+                        )
+                    loaded_gt = load_prediction_file(gt_path)
+                    if isinstance(loaded_gt, Image.Image):
+                        gt_cell = resize_to_cell(loaded_gt, cell_size)
+                        gt_stats = None
+                    else:
+                        gt_stats = prediction_stats(loaded_gt)
+                        gt_cell = prediction_to_image(
+                            loaded_gt,
+                            cell_size=cell_size,
+                            cmap=args.cmap,
+                            low=args.normalize_low,
+                            high=args.normalize_high,
+                            invert=args.invert_gt_depth,
+                        )
+                    row_meta["gt"] = {
+                        "source": str(gt_path),
+                        "prediction_stats": gt_stats,
+                    }
+            except Exception as exc:
+                if args.missing_policy == "error":
+                    raise
+                gt_cell = placeholder_cell(str(exc), cell_size, small_font)
+                row_meta["gt"] = {"error": str(exc)}
+            canvas.paste(gt_cell, (gt_x, y))
+            model_col_start += 1
+
+        for col_idx, spec in enumerate(specs, start=model_col_start):
             x = col_idx * (args.cell_width + gap)
             try:
                 if spec.kind != "predictions":
