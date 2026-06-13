@@ -8,6 +8,7 @@ import shutil
 import shlex
 import subprocess
 import sys
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
@@ -391,6 +392,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--cuda-visible-devices", default=None)
+    parser.add_argument(
+        "--no-filter-unsupported-args",
+        action="store_true",
+        help=(
+            "Do not inspect evaluator --help output. By default unsupported "
+            "optional arguments are removed per repo for compatibility."
+        ),
+    )
 
     parser.add_argument(
         "--hamlyn-aware-corruptions-root",
@@ -620,6 +629,11 @@ def print_dry_run(args: argparse.Namespace, plans: list[RunPlan]) -> None:
 
 def run_plan(plan: RunPlan, args: argparse.Namespace) -> None:
     plan.log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = plan.command
+    removed_args: list[str] = []
+    if not args.no_filter_unsupported_args:
+        command, removed_args = filter_unsupported_args(plan.command, plan.repo_root)
+
     with open(plan.manifest_path, "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -627,7 +641,9 @@ def run_plan(plan: RunPlan, args: argparse.Namespace) -> None:
                 "model": plan.model,
                 "condition": plan.condition,
                 "repo_root": str(plan.repo_root),
-                "command": plan.command,
+                "command": command,
+                "original_command": plan.command,
+                "removed_unsupported_args": removed_args,
                 "output_csv": str(plan.output_csv),
                 "warnings": plan.warnings,
             },
@@ -645,9 +661,11 @@ def run_plan(plan: RunPlan, args: argparse.Namespace) -> None:
 
     print(f"[RUN] {plan.dataset}/{plan.condition}/{plan.model}")
     with open(plan.log_path, "w", encoding="utf-8") as log:
-        log.write(" ".join(shlex.quote(part) for part in plan.command) + "\n\n")
+        if removed_args:
+            log.write("[INFO] removed unsupported args: " + " ".join(removed_args) + "\n")
+        log.write(" ".join(shlex.quote(part) for part in command) + "\n\n")
         proc = subprocess.run(
-            plan.command,
+            command,
             cwd=str(plan.repo_root),
             env=env,
             stdout=log,
@@ -664,6 +682,43 @@ def run_plan(plan: RunPlan, args: argparse.Namespace) -> None:
             f"Expected metrics CSV was not produced for {plan.dataset}/{plan.condition}/{plan.model}: "
             f"{plan.output_csv}"
         )
+
+
+def evaluator_supported_options(command: list[str], cwd: Path) -> set[str]:
+    help_command = [command[0], command[1], "--help"]
+    proc = subprocess.run(
+        help_command,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    text = proc.stdout or ""
+    return set(re.findall(r"--[A-Za-z0-9][A-Za-z0-9_-]*", text))
+
+
+def filter_unsupported_args(command: list[str], cwd: Path) -> tuple[list[str], list[str]]:
+    if len(command) < 2:
+        return command, []
+    supported = evaluator_supported_options(command, cwd)
+    if not supported:
+        return command, []
+
+    filtered = command[:2]
+    removed: list[str] = []
+    i = 2
+    while i < len(command):
+        token = command[i]
+        if token.startswith("--") and token not in supported:
+            removed.append(token)
+            i += 1
+            while i < len(command) and not command[i].startswith("--"):
+                removed.append(command[i])
+                i += 1
+            continue
+        filtered.append(token)
+        i += 1
+    return filtered, removed
 
 
 def first_file_under(root: Path, name: str) -> Path:
