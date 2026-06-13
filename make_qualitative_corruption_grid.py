@@ -57,6 +57,7 @@ DISPLAY_LABELS = {
     "brightness": "Bright",
     "bright": "Bright",
     "dark": "Dark",
+    "darkness": "Darkness",
     "fog": "Fog",
     "frost": "Frost",
     "snow": "Snow",
@@ -84,6 +85,38 @@ DISPLAY_LABELS = {
     "pixelate": "Pixelate",
     "jpeg_compression": "JPEG",
     "jpeg": "JPEG",
+    "lens_distortion": "Lens Distortion",
+    "resolution_change": "Resolution Change",
+    "specular_reflection": "Specular Reflection",
+    "color_changes": "Color Changes",
+}
+
+CORRUPTION_ABBREVIATIONS = {
+    "brightness": "B",
+    "bright": "B",
+    "dark": "D",
+    "darkness": "D",
+    "lens_distortion": "LD",
+    "resolution_change": "RC",
+    "specular_reflection": "SR",
+    "color_changes": "CC",
+    "contrast": "C",
+    "defocus_blur": "DB",
+    "defocus": "DB",
+    "glass_blur": "GB",
+    "glass": "GB",
+    "motion_blur": "MB",
+    "motion": "MB",
+    "zoom_blur": "ZB",
+    "zoom": "ZB",
+    "gaussian_noise": "GN",
+    "gaussian": "GN",
+    "impulse_noise": "IN",
+    "impulse": "IN",
+    "shot_noise": "SN",
+    "shot": "SN",
+    "iso_noise": "ISO",
+    "iso": "ISO",
 }
 
 
@@ -1065,6 +1098,11 @@ def parse_args() -> argparse.Namespace:
         help="Header label for the GT depth column.",
     )
     parser.add_argument(
+        "--input_label",
+        default="Input",
+        help="Header label for the corrupted input image column.",
+    )
+    parser.add_argument(
         "--models_json",
         default=None,
         help=(
@@ -1172,6 +1210,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gap", type=int, default=4)
     parser.add_argument("--font_size", type=int, default=18)
     parser.add_argument("--label_font_size", type=int, default=17)
+    parser.add_argument(
+        "--paper_style",
+        action="store_true",
+        help=(
+            "Use a compact paper-style table: plain headers, a separate corruption "
+            "abbreviation column, and no labels overlaid on image cells."
+        ),
+    )
+    parser.add_argument(
+        "--row_label_mode",
+        choices=["overlay", "column", "none"],
+        default=None,
+        help=(
+            "How to show corruption labels. Defaults to 'column' with --paper_style "
+            "and 'overlay' otherwise."
+        ),
+    )
+    parser.add_argument("--row_label_width", type=int, default=44)
+    parser.add_argument("--row_label_header", default="Corr.")
+    parser.add_argument(
+        "--header_style",
+        choices=["colored", "plain"],
+        default=None,
+        help="Header rendering style. Defaults to 'plain' with --paper_style.",
+    )
     parser.add_argument("--cmap", default="magma")
     parser.add_argument("--normalize_low", type=float, default=2.0)
     parser.add_argument("--normalize_high", type=float, default=98.0)
@@ -1949,9 +2012,20 @@ def draw_header(
     label: str,
     font: ImageFont.ImageFont,
     fill: tuple[int, int, int],
+    style: str = "colored",
 ) -> None:
     draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle((x, y, x + width - 1, y + height - 1), radius=4, fill=fill)
+    if style == "plain":
+        draw.rectangle((x, y, x + width - 1, y + height - 1), fill=(255, 255, 255))
+        draw.line((x, y + height - 1, x + width - 1, y + height - 1), fill=(185, 185, 185), width=1)
+        text_fill = (28, 28, 28)
+        stroke_width = 0
+        stroke_fill = text_fill
+    else:
+        draw.rounded_rectangle((x, y, x + width - 1, y + height - 1), radius=4, fill=fill)
+        text_fill = (255, 255, 255)
+        stroke_width = 1
+        stroke_fill = (20, 20, 20)
     fitted_font = fit_font_to_box(
         label,
         font,
@@ -1959,16 +2033,16 @@ def draw_header(
         max_height=height - 6,
         bold=True,
     )
-    bbox = draw.textbbox((0, 0), label, font=fitted_font, stroke_width=1)
+    bbox = draw.textbbox((0, 0), label, font=fitted_font, stroke_width=stroke_width)
     tx = x + (width - (bbox[2] - bbox[0])) // 2
     ty = y + (height - (bbox[3] - bbox[1])) // 2 - 1
     draw.text(
         (tx, ty),
         label,
-        fill=(255, 255, 255),
+        fill=text_fill,
         font=fitted_font,
-        stroke_width=1,
-        stroke_fill=(20, 20, 20),
+        stroke_width=stroke_width,
+        stroke_fill=stroke_fill,
     )
 
 
@@ -2012,8 +2086,40 @@ def draw_row_label(cell: Image.Image, label: str, font: ImageFont.ImageFont) -> 
     return cell.convert("RGB")
 
 
+def draw_row_label_cell(
+    canvas: Image.Image,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    label: str,
+    font: ImageFont.ImageFont,
+) -> None:
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((x, y, x + width - 1, y + height - 1), fill=(255, 255, 255))
+    fitted_font = fit_font_to_box(
+        label,
+        font,
+        max_width=width - 6,
+        max_height=height - 6,
+        bold=True,
+        min_size=8,
+    )
+    bbox = draw.textbbox((0, 0), label, font=fitted_font)
+    tx = x + (width - (bbox[2] - bbox[0])) // 2
+    ty = y + (height - (bbox[3] - bbox[1])) // 2 - 1
+    draw.text((tx, ty), label, fill=(38, 38, 38), font=fitted_font)
+
+
 def display_label(corruption: str) -> str:
     return DISPLAY_LABELS.get(corruption.lower(), corruption.replace("_", " ").title())
+
+
+def corruption_abbreviation(corruption: str) -> str:
+    return CORRUPTION_ABBREVIATIONS.get(
+        corruption.lower(),
+        "".join(part[:1] for part in corruption.replace("-", "_").split("_") if part).upper(),
+    )
 
 
 def valid_weights_folder(path: Path, kind: str = "monodepth2") -> bool:
@@ -2544,15 +2650,27 @@ def main() -> None:
     header_font = load_font(args.font_size, bold=True)
     label_font = load_font(args.label_font_size, bold=True)
     small_font = load_font(max(10, args.label_font_size - 1), bold=False)
+    row_label_mode = args.row_label_mode or ("column" if args.paper_style else "overlay")
+    header_style = args.header_style or ("plain" if args.paper_style else "colored")
+    gap = args.gap
 
-    columns = ["Input"] + ([args.gt_label] if include_gt else []) + [spec.name for spec in specs]
+    visual_columns = [args.input_label] + ([args.gt_label] if include_gt else []) + [spec.name for spec in specs]
+    columns = ([args.row_label_header] if row_label_mode == "column" else []) + visual_columns
+    col_widths = (
+        [args.row_label_width] if row_label_mode == "column" else []
+    ) + [args.cell_width] * len(visual_columns)
+    col_xs: list[int] = []
+    x_cursor = 0
+    for width in col_widths:
+        col_xs.append(x_cursor)
+        x_cursor += width + gap
+    visual_col_offset = 1 if row_label_mode == "column" else 0
     n_cols = len(columns)
     n_rows = len(corruptions)
-    gap = args.gap
     caption_h = 0
     if args.caption:
         caption_h = max(28, args.font_size + 14)
-    canvas_w = n_cols * args.cell_width + (n_cols - 1) * gap
+    canvas_w = sum(col_widths) + max(0, n_cols - 1) * gap
     canvas_h = (
         args.header_height
         + gap
@@ -2564,19 +2682,41 @@ def main() -> None:
 
     header_y = 0
     for col_idx, label in enumerate(columns):
-        x = col_idx * (args.cell_width + gap)
-        if col_idx == 0:
+        x = col_xs[col_idx]
+        width = col_widths[col_idx]
+        visual_idx = col_idx - visual_col_offset
+        if row_label_mode == "column" and col_idx == 0:
+            color = (255, 255, 255)
+        elif visual_idx == 0:
             color = (35, 72, 145)
-        elif include_gt and col_idx == 1:
+        elif include_gt and visual_idx == 1:
             color = (30, 118, 91)
         else:
             color = (153, 54, 45)
-        draw_header(canvas, x, header_y, args.cell_width, args.header_height, label, header_font, color)
+        draw_header(
+            canvas,
+            x,
+            header_y,
+            width,
+            args.header_height,
+            label,
+            header_font,
+            color,
+            style=header_style,
+        )
 
     metadata = {
         "corruptions_root": str(corruptions_root),
         "severity": args.severity,
         "reference_rel": reference_rel,
+        "layout": {
+            "paper_style": args.paper_style,
+            "row_label_mode": row_label_mode,
+            "row_label_width": args.row_label_width if row_label_mode == "column" else None,
+            "header_style": header_style,
+            "cell_size": list(cell_size),
+            "visual_columns_same_size": True,
+        },
         "gt": {
             "enabled": include_gt,
             "depths_file": str(Path(args.gt_depths_file).expanduser()) if args.gt_depths_file else None,
@@ -2615,21 +2755,35 @@ def main() -> None:
             exts=exts,
         )
         rgb = Image.open(image_path).convert("RGB")
+        if row_label_mode == "column":
+            draw_row_label_cell(
+                canvas,
+                col_xs[0],
+                y,
+                args.row_label_width,
+                args.cell_height,
+                corruption_abbreviation(corruption),
+                label_font,
+            )
+
         input_cell = resize_to_cell(rgb, cell_size)
-        input_cell = draw_row_label(input_cell, display_label(corruption), label_font)
-        canvas.paste(input_cell, (0, y))
+        if row_label_mode == "overlay":
+            input_cell = draw_row_label(input_cell, display_label(corruption), label_font)
+        canvas.paste(input_cell, (col_xs[visual_col_offset], y))
 
         row_meta = {
             "corruption": corruption,
+            "corruption_label": display_label(corruption),
+            "corruption_abbreviation": corruption_abbreviation(corruption),
             "image_path": str(image_path),
             "relative_path": row_rel,
             "gt": None,
             "cells": [],
         }
 
-        model_col_start = 1
+        model_col_start = visual_col_offset + 1
         if include_gt:
-            gt_x = args.cell_width + gap
+            gt_x = col_xs[visual_col_offset + 1]
             try:
                 if gt_depths is not None:
                     gt_values = gt_depth_from_stack(gt_depths, gt_index)
@@ -2681,7 +2835,7 @@ def main() -> None:
             model_col_start += 1
 
         for col_idx, spec in enumerate(specs, start=model_col_start):
-            x = col_idx * (args.cell_width + gap)
+            x = col_xs[col_idx]
             try:
                 if spec.kind != "predictions":
                     if isinstance(predictors[spec.name], Exception):
