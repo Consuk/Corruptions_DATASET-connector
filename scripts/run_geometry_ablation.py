@@ -1,0 +1,915 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from statistics import mean
+from typing import Iterable, Optional
+
+
+ERROR_METRICS = ("abs_rel", "sq_rel", "rmse", "rmse_log")
+ACCURACY_METRICS = ("a1", "a2", "a3")
+ALL_METRICS = ERROR_METRICS + ACCURACY_METRICS
+MODELS = (
+    "monodepth2",
+    "monovit",
+    "af_sfmlearner",
+    "endosfmlearner",
+    "endodac",
+    "monoiit",
+)
+DATASETS = ("hamlyn", "c3vd")
+CONDITIONS = ("aware", "ablated")
+
+
+METRIC_ALIASES = {
+    "abs rel": "abs_rel",
+    "abs_rel": "abs_rel",
+    "absrel": "abs_rel",
+    "sq rel": "sq_rel",
+    "sq_rel": "sq_rel",
+    "sqrel": "sq_rel",
+    "rmse": "rmse",
+    "rmse log": "rmse_log",
+    "rmse_log": "rmse_log",
+    "rmselog": "rmse_log",
+    "a1": "a1",
+    "a2": "a2",
+    "a3": "a3",
+    "delta1": "a1",
+    "delta2": "a2",
+    "delta3": "a3",
+    "d1": "a1",
+    "d2": "a2",
+    "d3": "a3",
+    "δ1": "a1",
+    "δ2": "a2",
+    "δ3": "a3",
+}
+
+
+@dataclass(frozen=True)
+class ModelEvalConfig:
+    repo_root: Path
+    script: str
+    weights: Path
+    default_args: tuple[str, ...]
+    output_style: str
+
+
+@dataclass
+class RunPlan:
+    dataset: str
+    model: str
+    condition: str
+    repo_root: Path
+    command: list[str]
+    output_csv: Path
+    log_path: Path
+    manifest_path: Path
+    warnings: list[str]
+
+
+def p(path: str) -> Path:
+    return Path(path)
+
+
+DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
+    "hamlyn": {
+        "monodepth2": ModelEvalConfig(
+            repo_root=p("/workspace/Monodepth2"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/hamlyn_weights/monodepth2_hamlyn_weights_19"),
+            default_args=(
+                "--splits_dir",
+                "/workspace/Monodepth2/splits",
+                "--split",
+                "hamlyn",
+                "--dataset",
+                "hamlyn",
+                "--min_depth",
+                "1",
+                "--max_depth",
+                "50",
+            ),
+            output_style="output_dir",
+        ),
+        "monovit": ModelEvalConfig(
+            repo_root=p("/workspace/monodepth2_monovit"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/hamlyn_weights/monovit_hamlyn_weights_19"),
+            default_args=(
+                "--splits_dir",
+                "/workspace/Monodepth2/splits",
+                "--split",
+                "hamlyn",
+                "--dataset",
+                "hamlyn",
+                "--min_depth",
+                "1",
+                "--max_depth",
+                "50",
+            ),
+            output_style="output_dir",
+        ),
+        "af_sfmlearner": ModelEvalConfig(
+            repo_root=p("/workspace/AF-SfMLearner"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/hamlyn_weights/afsfmlearner_hamlyn_weights_19"),
+            default_args=(
+                "--splits_dir",
+                "/workspace/AF-SfMLearner/splits",
+                "--split",
+                "hamlyn",
+                "--dataset",
+                "hamlyn",
+                "--min_depth",
+                "1",
+                "--max_depth",
+                "50",
+                "--hamlyn_strict_neighbors",
+            ),
+            output_style="output_dir",
+        ),
+        "endodac": ModelEvalConfig(
+            repo_root=p("/workspace/ENDO-DAC"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/hamlyn_weights/endodac_hamlyn_weights_last"),
+            default_args=(
+                "--splits_dir",
+                "/workspace/Monodepth2/splits",
+                "--split",
+                "hamlyn",
+                "--dataset",
+                "hamlyn",
+                "--min_depth",
+                "1",
+                "--max_depth",
+                "50",
+                "--learn_intrinsics",
+                "false",
+                "--hamlyn_use_intrinsics_file",
+                "true",
+                "--hamlyn_intrinsics_filename",
+                "intrinsics.txt",
+            ),
+            output_style="output_dir",
+        ),
+        "monoiit": ModelEvalConfig(
+            repo_root=p("/workspace/endo-manydepth/endo-manydepth-master/manydepth"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/hamlyn_weights/monoiit_manydepth_hamlyn_weights_19"),
+            default_args=(
+                "--splits_dir",
+                "/workspace/Monodepth2/splits",
+                "--split",
+                "hamlyn",
+                "--dataset",
+                "hamlyn",
+                "--min_depth",
+                "1",
+                "--max_depth",
+                "50",
+            ),
+            output_style="output_dir",
+        ),
+        "endosfmlearner": ModelEvalConfig(
+            repo_root=p("/workspace/repos/Endo-SfM-Learner-new-try"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/hamlyn_weights/endosfmlearner_hamlyn_weights"),
+            default_args=(
+                "--splits_dir",
+                "/workspace/repos/Endo-SfM-Learner-new-try/splits",
+                "--split",
+                "hamlyn",
+                "--dataset",
+                "hamlyn",
+                "--hamlyn_eval_min_depth",
+                "1.0",
+                "--hamlyn_eval_max_depth",
+                "50.0",
+            ),
+            output_style="output_csv",
+        ),
+    },
+    "c3vd": {
+        "monodepth2": ModelEvalConfig(
+            repo_root=p("/workspace/Monodepth2"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/c3vd_weights/monodepth2_c3vd_weights_19"),
+            default_args=(
+                "--dataset",
+                "c3vd",
+                "--split",
+                "c3vd",
+                "--splits_dir",
+                "/workspace/Monodepth2/splits",
+                "--height",
+                "256",
+                "--width",
+                "320",
+                "--batch_size",
+                "12",
+                "--min_depth",
+                "0.1",
+                "--max_depth",
+                "100.0",
+                "--c3vd_eval_min_depth",
+                "0.1",
+                "--c3vd_eval_max_depth",
+                "100.0",
+            ),
+            output_style="output_dir",
+        ),
+        "monovit": ModelEvalConfig(
+            repo_root=p("/workspace/monodepth2_monovit"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/c3vd_weights/monovit_c3vd_weights_19"),
+            default_args=(
+                "--dataset",
+                "c3vd",
+                "--split",
+                "c3vd",
+                "--splits_dir",
+                "/workspace/Monodepth2/splits",
+                "--height",
+                "256",
+                "--width",
+                "320",
+                "--batch_size",
+                "12",
+                "--min_depth",
+                "0.1",
+                "--max_depth",
+                "100.0",
+                "--c3vd_eval_min_depth",
+                "0.1",
+                "--c3vd_eval_max_depth",
+                "100.0",
+            ),
+            output_style="output_dir",
+        ),
+        "af_sfmlearner": ModelEvalConfig(
+            repo_root=p("/workspace/AF-SfMLearner"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/c3vd_weights/afsfmlearner_c3vd_weights_19"),
+            default_args=(
+                "--dataset",
+                "c3vd",
+                "--split",
+                "c3vd",
+                "--splits_dir",
+                "/workspace/repos/AF-SfMLearner/splits",
+                "--height",
+                "256",
+                "--width",
+                "320",
+                "--batch_size",
+                "12",
+                "--min_depth",
+                "0.1",
+                "--max_depth",
+                "100.0",
+                "--c3vd_eval_min_depth",
+                "0.1",
+                "--c3vd_eval_max_depth",
+                "100.0",
+                "--c3vd_use_loss_mask",
+                "--c3vd_mask_filename",
+                "mask.png",
+                "--c3vd_mask_erosion",
+                "1",
+            ),
+            output_style="output_dir",
+        ),
+        "endodac": ModelEvalConfig(
+            repo_root=p("/workspace/ENDO-DAC"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/c3vd_weights/endodac_c3vd_weights_last"),
+            default_args=(
+                "--dataset",
+                "c3vd",
+                "--split",
+                "c3vd",
+                "--splits_dir",
+                "/workspace/Monodepth2/splits",
+                "--height",
+                "224",
+                "--width",
+                "280",
+                "--batch_size",
+                "8",
+                "--min_depth",
+                "0.1",
+                "--max_depth",
+                "100.0",
+                "--c3vd_eval_min_depth",
+                "0.1",
+                "--c3vd_eval_max_depth",
+                "100.0",
+                "--learn_intrinsics",
+                "false",
+                "--c3vd_use_intrinsics_file",
+                "true",
+                "--num_workers",
+                "2",
+            ),
+            output_style="output_dir",
+        ),
+        "monoiit": ModelEvalConfig(
+            repo_root=p("/workspace/endo-manydepth/endo-manydepth-master/manydepth"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/c3vd_weights/monoiit_manydepth_c3vd_weights_19"),
+            default_args=(
+                "--split",
+                "c3vd",
+                "--splits_dir",
+                "/workspace/Monodepth2/splits",
+                "--height",
+                "256",
+                "--width",
+                "320",
+                "--png",
+                "--c3vd_eval_min_depth",
+                "0.1",
+                "--c3vd_eval_max_depth",
+                "100.0",
+            ),
+            output_style="output_csv",
+        ),
+        "endosfmlearner": ModelEvalConfig(
+            repo_root=p("/workspace/repos/Endo-SfM-Learner-new-try"),
+            script="eval_endovis_corruptions.py",
+            weights=p("/workspace/c3vd_weights/endosfmlearner_c3vd_weights"),
+            default_args=(
+                "--splits_dir",
+                "/workspace/Monodepth2/splits",
+                "--split",
+                "c3vd",
+                "--dataset",
+                "c3vd",
+                "--img_height",
+                "288",
+                "--img_width",
+                "512",
+                "--c3vd_eval_min_depth",
+                "0.1",
+                "--c3vd_eval_max_depth",
+                "100.0",
+            ),
+            output_style="output_csv",
+        ),
+    },
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run geometry-aware vs wrong-geometry ablations for Hamlyn and C3VD, "
+            "then compute raw metrics, mCE, mDERS, deltas, and a LaTeX table."
+        )
+    )
+    parser.add_argument("--dataset", choices=("all", "hamlyn", "c3vd"), default="all")
+    parser.add_argument("--models", nargs="+", default=list(MODELS), choices=MODELS)
+    parser.add_argument("--corruptions", nargs="+", default=["all"])
+    parser.add_argument("--severities", nargs="+", type=int, default=[1, 2, 3, 4, 5])
+    parser.add_argument("--output-dir", default="results/geometry_ablation")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--collect-only",
+        action="store_true",
+        help="Do not run evaluators; aggregate CSVs already present in the intermediate directory.",
+    )
+    parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--cuda-visible-devices", default=None)
+
+    parser.add_argument(
+        "--hamlyn-aware-corruptions-root",
+        default="/workspace/datasets/hamlyn/hamlyn_corruptions_test24",
+    )
+    parser.add_argument(
+        "--hamlyn-ablated-corruptions-root",
+        default="/workspace/datasets/hamlyn/hamlyn_corruptions_test24",
+        help=(
+            "Root used for the global-K Hamlyn condition. If the same images are used, "
+            "pass the repo-specific global-K override via --hamlyn-ablated-extra-args."
+        ),
+    )
+    parser.add_argument(
+        "--c3vd-aware-corruptions-root",
+        default="/workspace/datasets/c3vd_corrupted",
+    )
+    parser.add_argument(
+        "--c3vd-ablated-corruptions-root",
+        default="/workspace/datasets/c3vd_corrupted_raw",
+        help="Corruptions generated from raw omnidirectional C3VD frames.",
+    )
+    parser.add_argument("--hamlyn-aware-extra-args", default="")
+    parser.add_argument(
+        "--hamlyn-ablated-extra-args",
+        default="",
+        help="Repo-specific flags that force the global K_0 Hamlyn evaluation.",
+    )
+    parser.add_argument("--c3vd-aware-extra-args", default="")
+    parser.add_argument(
+        "--c3vd-ablated-extra-args",
+        default="",
+        help=(
+            "Repo-specific flags for raw-omni-as-pinhole C3VD evaluation, such as "
+            "a raw data_path or disabling pinhole preprocessing."
+        ),
+    )
+    parser.add_argument(
+        "--allow-empty-ablation-overrides",
+        action="store_true",
+        help=(
+            "Allow ablated Hamlyn/C3VD runs without explicit extra args. Use only when "
+            "the ablated root itself fully encodes the wrong-geometry protocol."
+        ),
+    )
+    return parser.parse_args()
+
+
+def selected_datasets(raw: str) -> list[str]:
+    return list(DATASETS) if raw == "all" else [raw]
+
+
+def selected_corruptions(raw: list[str]) -> Optional[set[str]]:
+    if len(raw) == 1 and raw[0].lower() == "all":
+        return None
+    return {normalize_text(item) for item in raw}
+
+
+def normalize_text(value: str) -> str:
+    return value.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def split_extra_args(value: str) -> list[str]:
+    return shlex.split(value) if value.strip() else []
+
+
+def condition_corruptions_root(args: argparse.Namespace, dataset: str, condition: str) -> Path:
+    key = f"{dataset}_{condition}_corruptions_root"
+    return Path(getattr(args, key)).expanduser()
+
+
+def condition_extra_args(args: argparse.Namespace, dataset: str, condition: str) -> list[str]:
+    key = f"{dataset}_{condition}_extra_args"
+    return split_extra_args(getattr(args, key))
+
+
+def output_csv_for(plan_dir: Path, config: ModelEvalConfig) -> tuple[Path, list[str]]:
+    if config.output_style == "output_csv":
+        csv_path = plan_dir / "summary_by_severity.csv"
+        return csv_path, ["--output_csv", str(csv_path)]
+
+    csv_path = plan_dir / "summary_by_severity.csv"
+    return csv_path, [
+        "--run_name",
+        plan_dir.name,
+        "--output_dir",
+        str(plan_dir.parent),
+        "--summary_filename",
+        "summary_by_severity.csv",
+        "--per_corruption_filename",
+        "summary_by_corruption.csv",
+        "--global_avg_filename",
+        "summary_global.csv",
+    ]
+
+
+def build_plan(args: argparse.Namespace) -> list[RunPlan]:
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    plans: list[RunPlan] = []
+    for dataset in selected_datasets(args.dataset):
+        for condition in CONDITIONS:
+            root = condition_corruptions_root(args, dataset, condition)
+            extra_args = condition_extra_args(args, dataset, condition)
+            if condition == "ablated" and not extra_args and not args.allow_empty_ablation_overrides:
+                if dataset == "hamlyn" or (
+                    dataset == "c3vd"
+                    and root == condition_corruptions_root(args, "c3vd", "aware")
+                ):
+                    raise RuntimeError(
+                        f"{dataset} ablated condition has no explicit geometry override. "
+                        f"Pass --{dataset}-ablated-extra-args with the repo flag(s), "
+                        "or --allow-empty-ablation-overrides if the ablated root already "
+                        "contains the wrong-geometry protocol."
+                    )
+
+            for model in args.models:
+                config = DEFAULT_CONFIGS[dataset][model]
+                plan_dir = output_dir / "intermediate" / dataset / condition / model
+                output_csv, output_flags = output_csv_for(plan_dir, config)
+                command = [
+                    args.python,
+                    config.script,
+                    "--corruptions_root",
+                    str(root),
+                    "--load_weights_folder",
+                    str(config.weights),
+                    *config.default_args,
+                    *extra_args,
+                    *output_flags,
+                ]
+                warnings = []
+                if condition == "ablated" and not extra_args:
+                    warnings.append("No condition-specific extra args were supplied.")
+                plans.append(
+                    RunPlan(
+                        dataset=dataset,
+                        model=model,
+                        condition=condition,
+                        repo_root=config.repo_root,
+                        command=command,
+                        output_csv=output_csv,
+                        log_path=plan_dir / "eval.log",
+                        manifest_path=plan_dir / "command.json",
+                        warnings=warnings,
+                    )
+                )
+    return plans
+
+
+def print_dry_run(args: argparse.Namespace, plans: list[RunPlan]) -> None:
+    print("Geometry ablation dry-run")
+    print(f"output_dir: {Path(args.output_dir).expanduser()}")
+    print(f"datasets: {', '.join(selected_datasets(args.dataset))}")
+    print(f"models: {', '.join(args.models)}")
+    print(
+        "corruptions: "
+        + ("all" if selected_corruptions(args.corruptions) is None else ", ".join(args.corruptions))
+    )
+    print(f"severities: {', '.join(str(s) for s in args.severities)}")
+    for plan in plans:
+        print("\n---")
+        print(f"dataset: {plan.dataset}")
+        print(f"model: {plan.model}")
+        print(f"condition: {plan.condition}")
+        print(f"workdir: {plan.repo_root}")
+        print(f"metrics_csv: {plan.output_csv}")
+        print(f"log: {plan.log_path}")
+        for warning in plan.warnings:
+            print(f"WARNING: {warning}")
+        print("command:")
+        print(" ".join(shlex.quote(part) for part in plan.command))
+
+
+def run_plan(plan: RunPlan, args: argparse.Namespace) -> None:
+    plan.log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(plan.manifest_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "dataset": plan.dataset,
+                "model": plan.model,
+                "condition": plan.condition,
+                "repo_root": str(plan.repo_root),
+                "command": plan.command,
+                "output_csv": str(plan.output_csv),
+                "warnings": plan.warnings,
+            },
+            f,
+            indent=2,
+        )
+
+    if args.skip_existing and plan.output_csv.is_file():
+        print(f"[SKIP] {plan.dataset}/{plan.condition}/{plan.model}: {plan.output_csv}")
+        return
+
+    env = os.environ.copy()
+    if args.cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+
+    print(f"[RUN] {plan.dataset}/{plan.condition}/{plan.model}")
+    with open(plan.log_path, "w", encoding="utf-8") as log:
+        log.write(" ".join(shlex.quote(part) for part in plan.command) + "\n\n")
+        proc = subprocess.run(
+            plan.command,
+            cwd=str(plan.repo_root),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Evaluation failed for {plan.dataset}/{plan.condition}/{plan.model}. "
+            f"See log: {plan.log_path}"
+        )
+    if not plan.output_csv.is_file():
+        raise FileNotFoundError(
+            f"Expected metrics CSV was not produced for {plan.dataset}/{plan.condition}/{plan.model}: "
+            f"{plan.output_csv}"
+        )
+
+
+def header_map(headers: Iterable[str]) -> dict[str, str]:
+    out = {}
+    for header in headers:
+        key = normalize_text(header).replace("__", "_")
+        metric = METRIC_ALIASES.get(key, key)
+        out[metric] = header
+    return out
+
+
+def parse_severity(value: str) -> int:
+    value = str(value).strip().lower()
+    if value.startswith("severity_"):
+        value = value.split("_")[-1]
+    return int(float(value))
+
+
+def row_float(row: dict[str, str], hmap: dict[str, str], key: str) -> float:
+    raw = row.get(hmap[key], "")
+    if raw == "":
+        raise ValueError(f"Missing metric {key}")
+    return float(raw)
+
+
+def find_column(hmap: dict[str, str], *candidates: str) -> Optional[str]:
+    for candidate in candidates:
+        key = normalize_text(candidate)
+        if key in hmap:
+            return hmap[key]
+    return None
+
+
+def load_metrics(plan: RunPlan, args: argparse.Namespace) -> list[dict]:
+    if not plan.output_csv.is_file():
+        raise FileNotFoundError(f"Missing CSV for {plan.dataset}/{plan.condition}/{plan.model}: {plan.output_csv}")
+
+    wanted_corruptions = selected_corruptions(args.corruptions)
+    wanted_severities = set(args.severities)
+    rows = []
+    with open(plan.output_csv, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return []
+        hmap = header_map(reader.fieldnames)
+        corruption_col = find_column(hmap, "corruption", "corr", "corruption_type")
+        severity_col = find_column(hmap, "severity", "sev")
+        n_col = find_column(hmap, "n_samples", "samples", "n")
+        missing_metrics = [metric for metric in ALL_METRICS if metric not in hmap]
+        if corruption_col is None or severity_col is None or missing_metrics:
+            raise ValueError(
+                f"{plan.output_csv} does not look like a severity metrics CSV. "
+                f"Missing columns: corruption={corruption_col is None}, "
+                f"severity={severity_col is None}, metrics={missing_metrics}"
+            )
+        for row in reader:
+            corruption = normalize_text(row[corruption_col])
+            severity = parse_severity(row[severity_col])
+            if wanted_corruptions is not None and corruption not in wanted_corruptions:
+                continue
+            if severity not in wanted_severities:
+                continue
+            item = {
+                "dataset": plan.dataset,
+                "model": plan.model,
+                "condition": plan.condition,
+                "corruption": corruption,
+                "severity": severity,
+                "source_csv": str(plan.output_csv),
+                "n_samples": int(float(row[n_col])) if n_col and row.get(n_col, "") else "",
+            }
+            for metric in ALL_METRICS:
+                item[metric] = row_float(row, hmap, metric)
+            item["mders"] = compute_mders(item)
+            rows.append(item)
+    return rows
+
+
+def compute_mders(values: dict[str, float]) -> float:
+    accuracy = (values["a1"] + values["a2"] + values["a3"]) / 3.0
+    error = (
+        values["abs_rel"]
+        + values["sq_rel"]
+        + values["rmse"]
+        + values["rmse_log"]
+    ) / 4.0
+    return accuracy / (1.0 + error)
+
+
+def average_metrics(rows: list[dict]) -> dict[str, float]:
+    out = {metric: mean(float(row[metric]) for row in rows) for metric in ALL_METRICS}
+    out["mders"] = compute_mders(out)
+    return out
+
+
+def group_rows(rows: list[dict], keys: tuple[str, ...]) -> dict[tuple, list[dict]]:
+    grouped: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = tuple(row[k] for k in keys)
+        grouped.setdefault(key, []).append(row)
+    return grouped
+
+
+def mean_by_corruption(rows: list[dict], metric: str) -> dict[str, float]:
+    grouped = group_rows(rows, ("corruption",))
+    return {
+        key[0]: mean(float(row[metric]) for row in bucket)
+        for key, bucket in grouped.items()
+    }
+
+
+def compute_mce_for_model(
+    model_rows: list[dict],
+    baseline_rows: list[dict],
+    metric: str,
+    lower_is_better: bool,
+) -> float:
+    model_by_corr = mean_by_corruption(model_rows, metric)
+    base_by_corr = mean_by_corruption(baseline_rows, metric)
+    common = sorted(set(model_by_corr).intersection(base_by_corr))
+    if not common:
+        raise ValueError(f"No common corruptions for mCE metric {metric}")
+    ratios = []
+    for corr in common:
+        model_value = model_by_corr[corr]
+        base_value = base_by_corr[corr]
+        if model_value == 0 or base_value == 0:
+            continue
+        ratio = model_value / base_value if lower_is_better else base_value / model_value
+        ratios.append(ratio)
+    if not ratios:
+        raise ValueError(f"No non-zero ratios for mCE metric {metric}")
+    return 100.0 * mean(ratios)
+
+
+def summarize(rows: list[dict]) -> list[dict]:
+    grouped = group_rows(rows, ("dataset", "condition", "model"))
+    baselines = {
+        (dataset, condition): bucket
+        for (dataset, condition, model), bucket in grouped.items()
+        if model == "monodepth2"
+    }
+    summaries = []
+    for (dataset, condition, model), bucket in sorted(grouped.items()):
+        baseline = baselines.get((dataset, condition))
+        if baseline is None:
+            raise ValueError(f"Missing Monodepth2 baseline for {dataset}/{condition}")
+        avg = average_metrics(bucket)
+        item = {
+            "dataset": dataset,
+            "model": model,
+            "condition": condition,
+            **avg,
+        }
+        for metric in ERROR_METRICS:
+            item[f"mce_{metric}"] = compute_mce_for_model(
+                bucket, baseline, metric, lower_is_better=True
+            )
+        for metric in ACCURACY_METRICS:
+            item[f"mce_{metric}"] = compute_mce_for_model(
+                bucket, baseline, metric, lower_is_better=False
+            )
+        item["mean_error_mce"] = mean(item[f"mce_{m}"] for m in ERROR_METRICS)
+        item["mean_accuracy_mce"] = mean(item[f"mce_{m}"] for m in ACCURACY_METRICS)
+        item["mean_mce"] = mean(item[f"mce_{m}"] for m in ALL_METRICS)
+        summaries.append(item)
+    return summaries
+
+
+def delta_table(summaries: list[dict]) -> list[dict]:
+    by_key = {
+        (row["dataset"], row["model"], row["condition"]): row
+        for row in summaries
+    }
+    out = []
+    for dataset in DATASETS:
+        models = sorted({row["model"] for row in summaries if row["dataset"] == dataset})
+        for model in models:
+            aware = by_key.get((dataset, model, "aware"))
+            ablated = by_key.get((dataset, model, "ablated"))
+            if aware is None or ablated is None:
+                continue
+            out.append(
+                {
+                    "dataset": dataset,
+                    "model": model,
+                    "mce_aware": aware["mean_mce"],
+                    "mce_ablated": ablated["mean_mce"],
+                    "delta_mce": ablated["mean_mce"] - aware["mean_mce"],
+                    "mders_aware": aware["mders"],
+                    "mders_ablated": ablated["mders"],
+                    "delta_mders": ablated["mders"] - aware["mders"],
+                }
+            )
+    return out
+
+
+def write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def format_float(value: float) -> str:
+    return f"{float(value):.3f}"
+
+
+def write_latex(path: Path, rows: list[dict]) -> None:
+    lines = [
+        r"\begin{tabular}{llrrrrrr}",
+        r"\toprule",
+        r"Dataset & Model & Geometry-aware mCE $\downarrow$ & Ablated mCE $\downarrow$ & $\Delta$mCE $\uparrow$ & Geometry-aware mDERS $\uparrow$ & Ablated mDERS $\uparrow$ & $\Delta$mDERS $\downarrow$ \\",
+        r"\midrule",
+    ]
+    for row in rows:
+        lines.append(
+            " & ".join(
+                [
+                    row["dataset"].upper(),
+                    row["model"],
+                    format_float(row["mce_aware"]),
+                    format_float(row["mce_ablated"]),
+                    format_float(row["delta_mce"]),
+                    format_float(row["mders_aware"]),
+                    format_float(row["mders_ablated"]),
+                    format_float(row["delta_mders"]),
+                ]
+            )
+            + r" \\"
+        )
+    lines.extend([r"\bottomrule", r"\end{tabular}", ""])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main() -> None:
+    args = parse_args()
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    plans = build_plan(args)
+    if args.dry_run:
+        print_dry_run(args, plans)
+        return
+
+    if not args.collect_only:
+        for plan in plans:
+            run_plan(plan, args)
+
+    raw_rows = []
+    for plan in plans:
+        raw_rows.extend(load_metrics(plan, args))
+    if not raw_rows:
+        raise RuntimeError("No raw metrics were collected.")
+
+    summary_rows = summarize(raw_rows)
+    delta_rows = delta_table(summary_rows)
+
+    raw_fields = [
+        "dataset",
+        "model",
+        "condition",
+        "corruption",
+        "severity",
+        *ALL_METRICS,
+        "mders",
+        "n_samples",
+        "source_csv",
+    ]
+    summary_fields = [
+        "dataset",
+        "model",
+        "condition",
+        *ALL_METRICS,
+        "mders",
+        *(f"mce_{m}" for m in ALL_METRICS),
+        "mean_error_mce",
+        "mean_accuracy_mce",
+        "mean_mce",
+    ]
+    delta_fields = [
+        "dataset",
+        "model",
+        "mce_aware",
+        "mce_ablated",
+        "delta_mce",
+        "mders_aware",
+        "mders_ablated",
+        "delta_mders",
+    ]
+
+    write_csv(output_dir / "geometry_ablation_raw_metrics.csv", raw_rows, list(raw_fields))
+    write_csv(output_dir / "geometry_ablation_summary.csv", summary_rows, list(summary_fields))
+    write_csv(output_dir / "geometry_ablation_delta.csv", delta_rows, list(delta_fields))
+    write_latex(output_dir / "geometry_ablation_table.tex", delta_rows)
+    print(f"Saved raw metrics: {output_dir / 'geometry_ablation_raw_metrics.csv'}")
+    print(f"Saved summary: {output_dir / 'geometry_ablation_summary.csv'}")
+    print(f"Saved delta: {output_dir / 'geometry_ablation_delta.csv'}")
+    print(f"Saved LaTeX table: {output_dir / 'geometry_ablation_table.tex'}")
+
+
+if __name__ == "__main__":
+    main()
