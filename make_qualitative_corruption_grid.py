@@ -1249,6 +1249,23 @@ def parse_args() -> argparse.Namespace:
         help="Invert GT depth before colorizing so it visually matches disparity maps.",
     )
     parser.add_argument(
+        "--gt_min_depth",
+        type=float,
+        default=None,
+        help="Minimum valid GT depth for visualization. Defaults to --min_depth.",
+    )
+    parser.add_argument(
+        "--gt_max_depth",
+        type=float,
+        default=None,
+        help="Maximum valid GT depth for visualization. Defaults to --max_depth.",
+    )
+    parser.add_argument(
+        "--no_mask_invalid_gt",
+        action="store_true",
+        help="Do not mask invalid/out-of-range GT values before visualization.",
+    )
+    parser.add_argument(
         "--missing_policy",
         choices=["placeholder", "error"],
         default="placeholder",
@@ -1725,6 +1742,45 @@ def prediction_to_image(
     norm = normalize_map(values, low, high)
     rgb = colormap_array(norm, cmap)
     return resize_to_cell(Image.fromarray(rgb, mode="RGB"), cell_size)
+
+
+def gt_to_image(
+    values: np.ndarray,
+    cell_size: tuple[int, int],
+    cmap: str,
+    low: float,
+    high: float,
+    invert: bool,
+    min_depth: Optional[float],
+    max_depth: Optional[float],
+    mask_invalid: bool,
+) -> Image.Image:
+    values = values.astype(np.float32)
+    visual = values.copy()
+    if mask_invalid:
+        valid = np.isfinite(values)
+        if min_depth is not None:
+            valid &= values > min_depth
+        if max_depth is not None:
+            valid &= values < max_depth
+        visual = np.full_like(values, np.nan, dtype=np.float32)
+        if invert:
+            visual[valid] = 1.0 / np.maximum(values[valid], 1e-8)
+        else:
+            visual[valid] = values[valid]
+    elif invert:
+        finite = np.isfinite(values)
+        visual = np.full_like(values, np.nan, dtype=np.float32)
+        visual[finite] = 1.0 / np.maximum(values[finite], 1e-8)
+
+    return prediction_to_image(
+        visual,
+        cell_size=cell_size,
+        cmap=cmap,
+        low=low,
+        high=high,
+        invert=False,
+    )
 
 
 def load_prediction_file(path: Path) -> np.ndarray | Image.Image:
@@ -2571,8 +2627,9 @@ def log_grid_to_wandb(
         },
     )
 
+    dataset_name = Path(str(metadata["corruptions_root"])).name or "corruptions"
     caption = args.caption or (
-        f"SCARED corruptions | severity={metadata['severity']} | "
+        f"{dataset_name} | severity={metadata['severity']} | "
         f"frame={metadata['reference_rel']}"
     )
     wandb.log({args.wandb_key: wandb.Image(str(output_path), caption=caption)})
@@ -2653,6 +2710,9 @@ def main() -> None:
     row_label_mode = args.row_label_mode or ("column" if args.paper_style else "overlay")
     header_style = args.header_style or ("plain" if args.paper_style else "colored")
     gap = args.gap
+    gt_min_depth = args.gt_min_depth if args.gt_min_depth is not None else args.min_depth
+    gt_max_depth = args.gt_max_depth if args.gt_max_depth is not None else args.max_depth
+    mask_invalid_gt = not args.no_mask_invalid_gt
 
     visual_columns = [args.input_label] + ([args.gt_label] if include_gt else []) + [spec.name for spec in specs]
     columns = ([args.row_label_header] if row_label_mode == "column" else []) + visual_columns
@@ -2725,6 +2785,9 @@ def main() -> None:
             "root": str(gt_root) if gt_root is not None else None,
             "label": args.gt_label,
             "invert": args.invert_gt_depth,
+            "mask_invalid": mask_invalid_gt,
+            "min_depth": gt_min_depth if mask_invalid_gt else None,
+            "max_depth": gt_max_depth if mask_invalid_gt else None,
         },
         "models": [
             {
@@ -2788,13 +2851,16 @@ def main() -> None:
                 if gt_depths is not None:
                     gt_values = gt_depth_from_stack(gt_depths, gt_index)
                     gt_stats = prediction_stats(gt_values)
-                    gt_cell = prediction_to_image(
+                    gt_cell = gt_to_image(
                         gt_values,
                         cell_size=cell_size,
                         cmap=args.cmap,
                         low=args.normalize_low,
                         high=args.normalize_high,
                         invert=args.invert_gt_depth,
+                        min_depth=gt_min_depth,
+                        max_depth=gt_max_depth,
+                        mask_invalid=mask_invalid_gt,
                     )
                     row_meta["gt"] = {
                         "source": str(Path(args.gt_depths_file).expanduser()),
@@ -2814,13 +2880,16 @@ def main() -> None:
                         gt_stats = None
                     else:
                         gt_stats = prediction_stats(loaded_gt)
-                        gt_cell = prediction_to_image(
+                        gt_cell = gt_to_image(
                             loaded_gt,
                             cell_size=cell_size,
                             cmap=args.cmap,
                             low=args.normalize_low,
                             high=args.normalize_high,
                             invert=args.invert_gt_depth,
+                            min_depth=gt_min_depth,
+                            max_depth=gt_max_depth,
+                            mask_invalid=mask_invalid_gt,
                         )
                     row_meta["gt"] = {
                         "source": str(gt_path),
