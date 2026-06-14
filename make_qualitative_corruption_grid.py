@@ -1235,6 +1235,32 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Header rendering style. Defaults to 'plain' with --paper_style.",
     )
+    parser.add_argument(
+        "--crop_to_input_region",
+        action="store_true",
+        help=(
+            "Crop input, GT, and prediction cells to the non-background region of "
+            "the input image before resizing. Useful for padded Hamlyn frames."
+        ),
+    )
+    parser.add_argument(
+        "--input_region_threshold",
+        type=float,
+        default=18.0,
+        help="RGB distance from border background used by --crop_to_input_region.",
+    )
+    parser.add_argument(
+        "--input_region_border_fraction",
+        type=float,
+        default=0.04,
+        help="Border fraction used to estimate the background color.",
+    )
+    parser.add_argument(
+        "--input_region_min_fraction",
+        type=float,
+        default=0.05,
+        help="Minimum detected content fraction required before applying the crop.",
+    )
     parser.add_argument("--cmap", default="magma")
     parser.add_argument("--normalize_low", type=float, default=2.0)
     parser.add_argument("--normalize_high", type=float, default=98.0)
@@ -1689,6 +1715,90 @@ def resize_to_cell(img: Image.Image, cell_size: tuple[int, int]) -> Image.Image:
     left = max(0, (resized.size[0] - cell_w) // 2)
     top = max(0, (resized.size[1] - cell_h) // 2)
     return resized.crop((left, top, left + cell_w, top + cell_h))
+
+
+def content_bbox_from_image(
+    image: Image.Image,
+    threshold: float,
+    border_fraction: float,
+    min_fraction: float,
+) -> Optional[tuple[int, int, int, int]]:
+    arr = np.asarray(image.convert("RGB")).astype(np.float32)
+    h, w = arr.shape[:2]
+    border = max(2, int(round(min(h, w) * max(0.0, border_fraction))))
+    border_pixels = np.concatenate(
+        [
+            arr[:border, :, :].reshape(-1, 3),
+            arr[-border:, :, :].reshape(-1, 3),
+            arr[:, :border, :].reshape(-1, 3),
+            arr[:, -border:, :].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    background = np.median(border_pixels, axis=0)
+    distance = np.linalg.norm(arr - background[None, None, :], axis=2)
+    mask = distance > threshold
+
+    if mask.mean() < min_fraction:
+        return None
+
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return None
+
+    pad = max(2, int(round(min(h, w) * 0.01)))
+    x0 = max(0, int(xs.min()) - pad)
+    y0 = max(0, int(ys.min()) - pad)
+    x1 = min(w, int(xs.max()) + 1 + pad)
+    y1 = min(h, int(ys.max()) + 1 + pad)
+
+    if x1 - x0 < max(8, int(w * min_fraction)) or y1 - y0 < max(8, int(h * min_fraction)):
+        return None
+    return x0, y0, x1, y1
+
+
+def scale_bbox(
+    bbox: Optional[tuple[int, int, int, int]],
+    source_size: tuple[int, int],
+    target_size: tuple[int, int],
+) -> Optional[tuple[int, int, int, int]]:
+    if bbox is None:
+        return None
+    source_w, source_h = source_size
+    target_w, target_h = target_size
+    x0, y0, x1, y1 = bbox
+    tx0 = max(0, min(target_w - 1, int(np.floor(x0 * target_w / max(1, source_w)))))
+    ty0 = max(0, min(target_h - 1, int(np.floor(y0 * target_h / max(1, source_h)))))
+    tx1 = max(tx0 + 1, min(target_w, int(np.ceil(x1 * target_w / max(1, source_w)))))
+    ty1 = max(ty0 + 1, min(target_h, int(np.ceil(y1 * target_h / max(1, source_h)))))
+    return tx0, ty0, tx1, ty1
+
+
+def crop_image_to_source_bbox(
+    image: Image.Image,
+    bbox: Optional[tuple[int, int, int, int]],
+    source_size: tuple[int, int],
+) -> Image.Image:
+    image = image.convert("RGB")
+    target_bbox = scale_bbox(bbox, source_size, image.size)
+    if target_bbox is None:
+        return image
+    return image.crop(target_bbox)
+
+
+def crop_array_to_source_bbox(
+    values: np.ndarray,
+    bbox: Optional[tuple[int, int, int, int]],
+    source_size: tuple[int, int],
+) -> np.ndarray:
+    if bbox is None or values.ndim < 2:
+        return values
+    h, w = values.shape[:2]
+    target_bbox = scale_bbox(bbox, source_size, (w, h))
+    if target_bbox is None:
+        return values
+    x0, y0, x1, y1 = target_bbox
+    return values[y0:y1, x0:x1]
 
 
 def safe_percentiles(values: np.ndarray, low: float, high: float) -> tuple[float, float]:
@@ -2866,6 +2976,8 @@ def main() -> None:
             "header_style": header_style,
             "cell_size": list(cell_size),
             "visual_columns_same_size": True,
+            "crop_to_input_region": args.crop_to_input_region,
+            "input_region_threshold": args.input_region_threshold if args.crop_to_input_region else None,
         },
         "gt": {
             "enabled": include_gt,
@@ -2910,6 +3022,16 @@ def main() -> None:
             exts=exts,
         )
         rgb = Image.open(image_path).convert("RGB")
+        input_region_bbox = (
+            content_bbox_from_image(
+                rgb,
+                threshold=args.input_region_threshold,
+                border_fraction=args.input_region_border_fraction,
+                min_fraction=args.input_region_min_fraction,
+            )
+            if args.crop_to_input_region
+            else None
+        )
         if row_label_mode == "column":
             draw_row_label_cell(
                 canvas,
@@ -2921,7 +3043,10 @@ def main() -> None:
                 label_font,
             )
 
-        input_cell = resize_to_cell(rgb, cell_size)
+        input_cell = resize_to_cell(
+            crop_image_to_source_bbox(rgb, input_region_bbox, rgb.size),
+            cell_size,
+        )
         if row_label_mode == "overlay":
             input_cell = draw_row_label(input_cell, display_label(corruption), label_font)
         canvas.paste(input_cell, (col_xs[visual_col_offset], y))
@@ -2932,6 +3057,7 @@ def main() -> None:
             "corruption_abbreviation": corruption_abbreviation(corruption),
             "image_path": str(image_path),
             "relative_path": row_rel,
+            "input_region_bbox": list(input_region_bbox) if input_region_bbox is not None else None,
             "gt": None,
             "cells": [],
         }
@@ -2942,9 +3068,14 @@ def main() -> None:
             try:
                 if gt_depths is not None:
                     gt_values = gt_depth_from_stack(gt_depths, gt_index)
+                    gt_values_for_cell = crop_array_to_source_bbox(
+                        gt_values,
+                        input_region_bbox,
+                        rgb.size,
+                    )
                     gt_stats = prediction_stats(gt_values)
                     gt_cell = gt_to_image(
-                        gt_values,
+                        gt_values_for_cell,
                         cell_size=cell_size,
                         cmap=args.cmap,
                         low=args.normalize_low,
@@ -2970,12 +3101,20 @@ def main() -> None:
                         )
                     loaded_gt = load_prediction_file(gt_path)
                     if isinstance(loaded_gt, Image.Image):
-                        gt_cell = resize_to_cell(loaded_gt, cell_size)
+                        gt_cell = resize_to_cell(
+                            crop_image_to_source_bbox(loaded_gt, input_region_bbox, rgb.size),
+                            cell_size,
+                        )
                         gt_stats = None
                     else:
                         gt_stats = prediction_stats(loaded_gt)
-                        gt_cell = gt_to_image(
+                        loaded_gt_for_cell = crop_array_to_source_bbox(
                             loaded_gt,
+                            input_region_bbox,
+                            rgb.size,
+                        )
+                        gt_cell = gt_to_image(
+                            loaded_gt_for_cell,
                             cell_size=cell_size,
                             cmap=args.cmap,
                             low=args.normalize_low,
@@ -3006,6 +3145,11 @@ def main() -> None:
                     if isinstance(predictors[spec.name], Exception):
                         raise RuntimeError(str(predictors[spec.name]))
                     pred = predictors[spec.name].predict(rgb)
+                    pred_for_cell = crop_array_to_source_bbox(
+                        pred,
+                        input_region_bbox,
+                        rgb.size,
+                    )
                     stats = prediction_stats(pred)
                     if args.print_prediction_stats and row_idx < args.prediction_stats_rows:
                         print(
@@ -3021,7 +3165,7 @@ def main() -> None:
                             )
                         )
                     cell = prediction_to_image(
-                        pred,
+                        pred_for_cell,
                         cell_size=cell_size,
                         cmap=args.cmap,
                         low=args.normalize_low,
@@ -3039,12 +3183,20 @@ def main() -> None:
                         )
                     loaded = load_prediction_file(pred_path)
                     if isinstance(loaded, Image.Image):
-                        cell = resize_to_cell(loaded, cell_size)
+                        cell = resize_to_cell(
+                            crop_image_to_source_bbox(loaded, input_region_bbox, rgb.size),
+                            cell_size,
+                        )
                         stats = None
                     else:
                         stats = prediction_stats(loaded)
-                        cell = prediction_to_image(
+                        loaded_for_cell = crop_array_to_source_bbox(
                             loaded,
+                            input_region_bbox,
+                            rgb.size,
+                        )
+                        cell = prediction_to_image(
+                            loaded_for_cell,
                             cell_size=cell_size,
                             cmap=args.cmap,
                             low=args.normalize_low,
