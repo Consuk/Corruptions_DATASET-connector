@@ -87,7 +87,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "monodepth2": ModelEvalConfig(
             repo_root=p("/workspace/Monodepth2"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/hamlyn_weights/monodepth2_hamlyn_weights_19"),
+            weights=p("/workspace/Monodepth2/logs/weights_hamlyn/hamlyn_monodepth/models/weights_19"),
             default_args=(
                 "--splits_dir",
                 "/workspace/Monodepth2/splits",
@@ -105,7 +105,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "monovit": ModelEvalConfig(
             repo_root=p("/workspace/monodepth2_monovit"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/hamlyn_weights/monovit_hamlyn_weights_19"),
+            weights=p("/workspace/monodepth2_monovit/monovit_hamlyn_01032026/models/weights_19"),
             default_args=(
                 "--splits_dir",
                 "/workspace/Monodepth2/splits",
@@ -123,7 +123,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "af_sfmlearner": ModelEvalConfig(
             repo_root=p("/workspace/repos/AF-SfMLearner"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/hamlyn_weights/afsfmlearner_hamlyn_weights_19"),
+            weights=p("/workspace/repos/AF-SfMLearner/hamlyn_asfm/models/weights_19"),
             default_args=(
                 "--splits_dir",
                 "/workspace/repos/AF-SfMLearner/splits",
@@ -142,7 +142,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "endodac": ModelEvalConfig(
             repo_root=p("/workspace/ENDO-DAC"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/hamlyn_weights/endodac_hamlyn_weights_last"),
+            weights=p("/workspace/ENDO-DAC/Hamlyn_logs/models/weights_last"),
             default_args=(
                 "--splits_dir",
                 "/workspace/Monodepth2/splits",
@@ -166,7 +166,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "monoiit": ModelEvalConfig(
             repo_root=p("/workspace/endo-manydepth/endo-manydepth-master/manydepth"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/hamlyn_weights/monoiit_manydepth_hamlyn_weights_19"),
+            weights=p("/workspace/endo-manydepth/endo-manydepth-master/manydepth/logs/hamlyn_monoiit/my_hamlyn_model/models/weights_19"),
             default_args=(
                 "--splits_dir",
                 "/workspace/Monodepth2/splits",
@@ -204,7 +204,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "monodepth2": ModelEvalConfig(
             repo_root=p("/workspace/Monodepth2"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/c3vd_weights/monodepth2_c3vd_weights_19"),
+            weights=p("/workspace/Monodepth2/logs/c3vd_md2_omni_undist_mask/models/weights_19"),
             default_args=(
                 "--dataset",
                 "c3vd",
@@ -232,7 +232,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "monovit": ModelEvalConfig(
             repo_root=p("/workspace/monodepth2_monovit"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/c3vd_weights/monovit_c3vd_weights_19"),
+            weights=p("/workspace/monodepth2_monovit/logs/c3vd_monovit_omni_undist_mask/models/weights_19"),
             default_args=(
                 "--dataset",
                 "c3vd",
@@ -260,7 +260,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "af_sfmlearner": ModelEvalConfig(
             repo_root=p("/workspace/repos/AF-SfMLearner"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/c3vd_weights/afsfmlearner_c3vd_weights_19"),
+            weights=p("/workspace/repos/AF-SfMLearner/logs/c3vd_afsfm_omni_undist_mask1/models/weights_19"),
             default_args=(
                 "--dataset",
                 "c3vd",
@@ -293,7 +293,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "endodac": ModelEvalConfig(
             repo_root=p("/workspace/ENDO-DAC"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/c3vd_weights/endodac_c3vd_weights_last"),
+            weights=p("/workspace/ENDO-DAC/logs/c3vd_endodac_omni_undist_mask/models/weights_last"),
             default_args=(
                 "--dataset",
                 "c3vd",
@@ -327,7 +327,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, ModelEvalConfig]] = {
         "monoiit": ModelEvalConfig(
             repo_root=p("/workspace/endo-manydepth/endo-manydepth-master/manydepth"),
             script="eval_endovis_corruptions.py",
-            weights=p("/workspace/c3vd_weights/monoiit_manydepth_c3vd_weights_19"),
+            weights=p("/workspace/endo-manydepth/endo-manydepth-master/manydepth/logs/c3vd_consuk_undist_monoiit_gap3_noauto_augfix/models/weights_19"),
             default_args=(
                 "--split",
                 "c3vd",
@@ -722,7 +722,9 @@ def filter_unsupported_args(command: list[str], cwd: Path) -> tuple[list[str], l
 
 
 def first_file_under(root: Path, name: str) -> Path:
-    for current_root, _, files in os.walk(root):
+    for current_root, dirs, files in os.walk(root):
+        dirs.sort()
+        files.sort()
         if name in files:
             return Path(current_root) / name
     raise FileNotFoundError(f"Could not find {name} under {root}")
