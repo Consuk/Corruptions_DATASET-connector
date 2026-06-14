@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
@@ -1266,6 +1266,20 @@ def parse_args() -> argparse.Namespace:
         help="Do not mask invalid/out-of-range GT values before visualization.",
     )
     parser.add_argument(
+        "--gt_dense_visualization",
+        action="store_true",
+        help=(
+            "Fill sparse/invalid GT holes for visualization only, useful for "
+            "paper figures when GT maps are sparse."
+        ),
+    )
+    parser.add_argument(
+        "--gt_dense_blur_radius",
+        type=float,
+        default=0.8,
+        help="Small RGB blur applied after dense GT visualization. Use 0 to disable.",
+    )
+    parser.add_argument(
         "--missing_policy",
         choices=["placeholder", "error"],
         default="placeholder",
@@ -1698,6 +1712,68 @@ def normalize_map(values: np.ndarray, low: float, high: float) -> np.ndarray:
     return norm
 
 
+def neighbor_values(
+    values: np.ndarray,
+    valid: np.ndarray,
+    dy: int,
+    dx: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    shifted_values = np.empty_like(values)
+    shifted_valid = np.zeros_like(valid, dtype=bool)
+
+    src_y0 = max(0, -dy)
+    src_y1 = values.shape[0] - max(0, dy)
+    dst_y0 = max(0, dy)
+    dst_y1 = values.shape[0] - max(0, -dy)
+    src_x0 = max(0, -dx)
+    src_x1 = values.shape[1] - max(0, dx)
+    dst_x0 = max(0, dx)
+    dst_x1 = values.shape[1] - max(0, -dx)
+
+    shifted_values.fill(0.0)
+    shifted_values[dst_y0:dst_y1, dst_x0:dst_x1] = values[src_y0:src_y1, src_x0:src_x1]
+    shifted_valid[dst_y0:dst_y1, dst_x0:dst_x1] = valid[src_y0:src_y1, src_x0:src_x1]
+    return shifted_values, shifted_valid
+
+
+def fill_invalid_nearest(values: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    if valid.all() or not valid.any():
+        return values
+
+    try:
+        from scipy import ndimage
+
+        _, indices = ndimage.distance_transform_edt(~valid, return_indices=True)
+        return values[tuple(indices)]
+    except Exception:
+        pass
+
+    filled = values.copy()
+    filled[~valid] = 0.0
+    current_valid = valid.copy()
+    max_iter = max(values.shape) * 2
+    offsets = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+    for _ in range(max_iter):
+        if current_valid.all():
+            break
+        accum = np.zeros_like(filled, dtype=np.float32)
+        counts = np.zeros_like(filled, dtype=np.float32)
+        for dy, dx in offsets:
+            neigh_values, neigh_valid = neighbor_values(filled, current_valid, dy, dx)
+            accum += neigh_values * neigh_valid
+            counts += neigh_valid.astype(np.float32)
+        update = ~current_valid & (counts > 0)
+        if not update.any():
+            break
+        filled[update] = accum[update] / counts[update]
+        current_valid[update] = True
+
+    if not current_valid.all():
+        fallback = float(np.nanmedian(values[valid]))
+        filled[~current_valid] = fallback
+    return filled
+
+
 def colormap_array(norm: np.ndarray, cmap_name: str) -> np.ndarray:
     try:
         import matplotlib
@@ -1754,11 +1830,13 @@ def gt_to_image(
     min_depth: Optional[float],
     max_depth: Optional[float],
     mask_invalid: bool,
+    dense_visualization: bool,
+    dense_blur_radius: float,
 ) -> Image.Image:
     values = values.astype(np.float32)
     visual = values.copy()
+    valid = np.isfinite(values)
     if mask_invalid:
-        valid = np.isfinite(values)
         if min_depth is not None:
             valid &= values > min_depth
         if max_depth is not None:
@@ -1772,8 +1850,16 @@ def gt_to_image(
         finite = np.isfinite(values)
         visual = np.full_like(values, np.nan, dtype=np.float32)
         visual[finite] = 1.0 / np.maximum(values[finite], 1e-8)
+        valid = finite
 
-    return prediction_to_image(
+    filled_dense = False
+    if dense_visualization:
+        dense_valid = np.isfinite(visual)
+        if dense_valid.any() and not dense_valid.all():
+            visual = fill_invalid_nearest(visual, dense_valid)
+            filled_dense = True
+
+    cell = prediction_to_image(
         visual,
         cell_size=cell_size,
         cmap=cmap,
@@ -1781,6 +1867,9 @@ def gt_to_image(
         high=high,
         invert=False,
     )
+    if filled_dense and dense_blur_radius > 0:
+        cell = cell.filter(ImageFilter.GaussianBlur(radius=float(dense_blur_radius)))
+    return cell
 
 
 def load_prediction_file(path: Path) -> np.ndarray | Image.Image:
@@ -2713,6 +2802,7 @@ def main() -> None:
     gt_min_depth = args.gt_min_depth if args.gt_min_depth is not None else args.min_depth
     gt_max_depth = args.gt_max_depth if args.gt_max_depth is not None else args.max_depth
     mask_invalid_gt = not args.no_mask_invalid_gt
+    dense_gt_visualization = args.gt_dense_visualization
 
     visual_columns = [args.input_label] + ([args.gt_label] if include_gt else []) + [spec.name for spec in specs]
     columns = ([args.row_label_header] if row_label_mode == "column" else []) + visual_columns
@@ -2788,6 +2878,8 @@ def main() -> None:
             "mask_invalid": mask_invalid_gt,
             "min_depth": gt_min_depth if mask_invalid_gt else None,
             "max_depth": gt_max_depth if mask_invalid_gt else None,
+            "dense_visualization": dense_gt_visualization,
+            "dense_blur_radius": args.gt_dense_blur_radius if dense_gt_visualization else None,
         },
         "models": [
             {
@@ -2861,6 +2953,8 @@ def main() -> None:
                         min_depth=gt_min_depth,
                         max_depth=gt_max_depth,
                         mask_invalid=mask_invalid_gt,
+                        dense_visualization=dense_gt_visualization,
+                        dense_blur_radius=args.gt_dense_blur_radius,
                     )
                     row_meta["gt"] = {
                         "source": str(Path(args.gt_depths_file).expanduser()),
@@ -2890,6 +2984,8 @@ def main() -> None:
                             min_depth=gt_min_depth,
                             max_depth=gt_max_depth,
                             mask_invalid=mask_invalid_gt,
+                            dense_visualization=dense_gt_visualization,
+                            dense_blur_radius=args.gt_dense_blur_radius,
                         )
                     row_meta["gt"] = {
                         "source": str(gt_path),
